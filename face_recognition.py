@@ -1,3 +1,4 @@
+import openpyxl
 import os
 import cv2
 import time
@@ -14,28 +15,29 @@ from typing import Dict, Any, List, Tuple
 # --- Configuration ---
 # NOTE: YOU MUST HAVE THESE WEIGHTS DOWNLOADED AND EMBEDDINGS CREATED
 YOLO_MODEL_PATH = 'detection/weights/yolov12n-best.pt' # YOLOv8 model for initial face detection
-EMBEDDINGS_FILE = 'known_embeddings.pkl'     # File containing known face embeddings
+EMBEDDINGS_FILE = 'known_embeddings.pkl'  # File containing known face embeddings
 STREAM_URL = 'rtsp://admin:1234qwer@@172.16.0.3:554/Streaming/Channels/102?tcp' # <<< CHANGE THIS TO YOUR IP CAMERA URL
-RECOGNITION_THRESHOLD = 1.0                  # Max Euclidean distance for a match (typically 0.9 to 1.1 for FaceNet)
+RECOGNITION_THRESHOLD = 1.0         # Max Euclidean distance for a match (typically 0.9 to 1.1 for FaceNet)
 # ADJUSTED: Raised the threshold back up to 0.65. This filters out the false positives 
 # (non-face objects) while still being sensitive enough for most faces.
-YOLO_CONFIDENCE_THRESHOLD = 0.65             # Minimum confidence score (0.0 to 1.0) for YOLO to accept a detection.
+YOLO_CONFIDENCE_THRESHOLD = 0.65       # Minimum confidence score (0.0 to 1.0) for YOLO to accept a detection.
 
 # --- Temporal Consistency Settings (The "Double-Check" Logic) ---
-CONFIRM_FRAMES = 5                           # Number of recent frames to check for consistency.
-REQUIRED_VOTES = 3                           # Number of votes required in CONFIRM_FRAMES for a stable ID.
-MAX_BOX_DISTANCE = 50                        # Max pixel distance between box centers to consider them the same person.
+CONFIRM_FRAMES = 5              # Number of recent frames to check for consistency.
+REQUIRED_VOTES = 3              # Number of votes required in CONFIRM_FRAMES for a stable ID.
+MAX_BOX_DISTANCE = 50            # Max pixel distance between box centers to consider them the same person.
 
 # --- Global Variables for FAISS ---
 # These will hold the FAISS index and the corresponding list of names
 FAISS_INDEX = None
+# KNOWN_NAMES must be a flattened list, where each entry maps 1:1 to an embedding in the FAISS index.
 KNOWN_NAMES = []
 
 
 # --- 1. Model Initialization ---
 # Load YOLOv8 model (used for fast, rough face cropping)
 try:
-    model_yolo = YOLO(YOLO_MODEL_PATH)  
+    model_yolo = YOLO(YOLO_MODEL_PATH) 
     print("YOLOv8 model loaded successfully.")
 except Exception as e:
     print(f"Error loading YOLOv8 model: {e}")
@@ -59,38 +61,50 @@ except Exception as e:
 def load_known_embeddings() -> Tuple[faiss.Index or None, List[str], bool]:
     """
     Loads known face embeddings and builds a FAISS index for fast nearest-neighbor search.
+    FIX: Ensures KNOWN_NAMES is a flattened list corresponding 1:1 with the FAISS index vectors.
     Returns: (faiss_index, list_of_names, success_status)
     """
     global FAISS_INDEX, KNOWN_NAMES
     
     try:
         with open(EMBEDDINGS_FILE, 'rb') as f:
+            # raw_embeddings: Dict[str, List[np.ndarray]] = {name: [emb1, emb2, ...]}
             raw_embeddings = pickle.load(f)
             
             if not raw_embeddings:
                 print(f"Warning: {EMBEDDINGS_FILE} is empty.")
                 return None, [], False
 
-            # 1. Extract names and embeddings into structured lists
-            names_list = list(raw_embeddings.keys())
-            embeddings_list = [np.array(emb) for emb in raw_embeddings.values()]
+            # --- CRITICAL FIX START ---
+            all_names: List[str] = [] # List to hold the name for every single embedding
+            all_embeddings: List[np.ndarray] = [] # List to hold every single embedding vector
+
+            for name, embeddings in raw_embeddings.items():
+                for emb in embeddings:
+                    all_names.append(name)
+                    all_embeddings.append(emb)
             
             # 2. Convert to a single NumPy matrix (float32 required by FAISS)
-            embeddings_matrix = np.vstack(embeddings_list).astype('float32')
+            if not all_embeddings:
+                print(f"Warning: No embeddings found after flattening.")
+                return None, [], False
+                
+            embeddings_matrix = np.vstack(all_embeddings).astype('float32')
             D = embeddings_matrix.shape[1] # Dimension (should be 512)
-
+            
             # 3. Initialize FAISS Index (Flat L2 for exact Euclidean distance)
-            # IndexFlatL2 provides the same exact distance calculation as numpy.linalg.norm, but optimized
             index = faiss.IndexFlatL2(D)
             index.add(embeddings_matrix)
             
-            print(f"Known embeddings loaded and FAISS index built successfully. ({len(names_list)} identities)")
+            # --- CRITICAL FIX END ---
+            
+            print(f"Known embeddings loaded and FAISS index built successfully. ({len(raw_embeddings)} identities, {len(all_names)} total embeddings)")
             
             # Store globally for use in the recognition loop
             FAISS_INDEX = index
-            KNOWN_NAMES = names_list
+            KNOWN_NAMES = all_names # Now KNOWN_NAMES has the same length as the FAISS index
             
-            return index, names_list, True
+            return index, all_names, True
             
     except Exception as e:
         print(f"FATAL: Error loading or building FAISS index from {EMBEDDINGS_FILE}: {e}")
@@ -209,6 +223,39 @@ def find_nearest_tracked_face(current_box: Tuple[int, int, int, int]) -> int or 
             
     return matched_id
 
+def write_to_excel(name, status):
+    """
+    Function to write to the Excel file.
+    """
+    try:
+        for row_idx, row in enumerate(sheet.iter_rows(min_row=2, max_col=1, values_only=True), start=2):
+            if row[0] == name:
+                # Find the last empty cell in the row
+                col_idx = 2  # Start from the second column (Column B)
+                while sheet.cell(row=row_idx, column=col_idx).value is not None:
+                    col_idx += 1  # Move to the next column
+
+                # Write the status (Late or Absent) with the current date and time
+                sheet.cell(row=row_idx, column=col_idx).value = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {status}"
+                workbook.save('DashBoard.xlsx')
+                print(f"{name} has been recorded as {status} in the Excel file.")
+                break
+    except Exception as e:
+        print(f"Error writing to Excel file: {e}")
+
+def check_absence():
+    """
+    Function to check and record absence for all names not recognized before 9:00 AM.
+    """
+    for row_idx, row in enumerate(sheet.iter_rows(min_row=2, max_col=1, values_only=True), start=2):
+        name = row[0]
+        if name not in recognized_names:
+            print(f"{name} is absent.")
+            write_to_excel(name, "Absent")
+    print("Absence recorded for all missing names.")
+
+
+
 def determine_stable_name(history_list: List[str]) -> str:
     """Determines the stable name based on the majority vote in the history."""
     if not history_list:
@@ -230,7 +277,7 @@ def determine_stable_name(history_list: List[str]) -> str:
 
 # --- 4. Real-Time Recognition Loop ---
 
-def recognize_faces_in_stream():
+def real_time_face_recognition():
     global face_history, current_face_id
 
     # Load the known embeddings and build the FAISS index
@@ -372,11 +419,10 @@ if __name__ == "__main__":
     except ImportError:
         print("FATAL ERROR: FAISS is not installed. Please install it using: pip install faiss-cpu")
         exit()
-        
     if model_yolo is None or mtcnn is None or resnet is None:
         print("\nExiting: Critical models failed to load. Please check model paths and dependencies.")
     else:
         # Run the real-time recognition loop
-        recognize_faces_in_stream()
+        real_time_face_recognition()
 
     print("\nApplication terminated.")
