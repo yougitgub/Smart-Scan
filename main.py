@@ -6,5 +6,4 @@ if __name__ == "__main__":
         print("No known embeddings found. Generating from enrollment images...")
         generate_known_embeddings(ENROLLMENT_DIRECTORY)
     root.mainloop()
-    real_time_face_recognition()  # Start the main face recognition function
-    check_absence()  # Check and mark absences in the Excel sheet
+    face_recognition()
