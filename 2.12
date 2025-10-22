@@ -1,0 +1,6 @@
+Collecting pybind11
+  Downloading pybind11-3.0.1-py3-none-any.whl.metadata (10.0 kB)
+Downloading pybind11-3.0.1-py3-none-any.whl (293 kB)
+   ---------------------------------------- 293.6/293.6 kB 1.6 MB/s eta 0:00:00
+Installing collected packages: pybind11
+Successfully installed pybind11-3.0.1

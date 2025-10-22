@@ -204,7 +204,6 @@ class TimeConfigApp:
 
             # 4. Save to JSON file
             save_settings(CONFIG_FILE, new_settings)
-            print("New settings saved:", new_settings)
 
             messagebox.showinfo("Success", "All time settings have been saved successfully. System will start now.")
             
@@ -221,9 +220,5 @@ class TimeConfigApp:
                 messagebox.showinfo("Re-Scan Complete", "Student images have been re-scanned and embeddings updated.")
             except Exception as e:
                 messagebox.showerror("Re-Scan Error", f"An error occurred during re-scan: {e}")
-
-def disable_event():
-    pass  
 root = tk.Tk()
-root.protocol("WM_DELETE_WINDOW", disable_event)
 app = TimeConfigApp(root)
