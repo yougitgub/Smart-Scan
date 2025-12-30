@@ -1,11 +1,11 @@
-import openpyxl
 import os
 import cv2
 import time
-import threading # Required for the CameraHandler class
+import threading
+import queue
 import torch
-import faiss # New: FAISS for fast nearest-neighbor search
-# Importing facenet_pytorch components
+import faiss
+import faiss
 from facenet_pytorch import MTCNN, InceptionResnetV1
 from ultralytics import YOLO
 import pickle
@@ -13,182 +13,328 @@ import numpy as np
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime, time as dtime, timedelta
 import json
+import mysql.connector
 
 # --- Configuration ---
-# NOTE: YOU MUST HAVE THESE WEIGHTS DOWNLOADED AND EMBEDDINGS CREATED
-YOLO_MODEL_PATH = 'detection/weights/yolov12n-best.pt' # YOLOv8 model for initial face detection
-EMBEDDINGS_FILE = 'known_embeddings.pkl'  # File containing known face embeddings
-STREAM_URL = 'rtsp://admin:1234qwer@@172.16.0.3:554/Streaming/Channels/102?tcp' # <<< CHANGE THIS TO YOUR IP CAMERA URL
-RECOGNITION_THRESHOLD = 1.0         # Max Euclidean distance for a match (typically 0.9 to 1.1 for FaceNet)
-# ADJUSTED: Raised the threshold back up to 0.65. This filters out the false positives 
-# (non-face objects) while still being sensitive enough for most faces.
-YOLO_CONFIDENCE_THRESHOLD = 0.75       # Minimum confidence score (0.0 to 1.0) for YOLO to accept a detection.
+YOLO_MODEL_PATH = 'detection/weights/yolov12n-face.pt'
+EMBEDDINGS_FILE = 'known_embeddings.pkl'
+STREAM_URL = 'rtsp://admin:1234qwer@@192.168.1.18:554/Streaming/Channels/102?tcp'
 
-# --- Temporal Consistency Settings (The "Double-Check" Logic) ---
-CONFIRM_FRAMES = 1              # Number of recent frames to check for consistency.
-REQUIRED_VOTES = 1              # Number of votes required in CONFIRM_FRAMES for a stable ID.
-MAX_BOX_DISTANCE = 50            # Max pixel distance between box centers to consider them the same person.
+# --- THRESHOLDS ---
+RECOGNITION_THRESHOLD = 1.1
+STRICT_THRESHOLD = 0.85
+YOLO_CONFIDENCE_THRESHOLD = 0.75
 
-# --- Global Variables for FAISS ---
-# These will hold the FAISS index and the corresponding list of names
-FAISS_INDEX = None
-# KNOWN_NAMES must be a flattened list, where each entry maps 1:1 to an embedding in the FAISS index.
-KNOWN_NAMES = []
+# --- Temporal Consistency Settings ---
+CONFIRM_FRAMES = 1
+REQUIRED_VOTES = 1
+MAX_BOX_DISTANCE = 50
 
-# Workbook and sheet for attendance (optional)
-workbook = None
-sheet = None
-try:
-    if os.path.exists('DashBoard.xlsx'):
-        workbook = openpyxl.load_workbook('DashBoard.xlsx')
-        sheet = workbook.active
-except Exception:
-    workbook = None
-    sheet = None
+# --- MySQL Config ---
+DB_CONFIG = {
+    'host': '127.0.0.1',
+    'port': 3306,
+    'user': 'root',
+    'password': '', 
+    'database': 'system'
+}
 
-# Runtime set of names already marked/recognized (to avoid duplicate writes)
-recognized_names = set()
+# --- Global Shared Resources ---
+# Queues
+db_queue = queue.Queue()
+recog_queue = queue.Queue(maxsize=2)  # Limit queue size to prevent latency buildup
 
+# Shared State (Protected by Lock where necessary)
+state_lock = threading.Lock()
+shared_latest_frame = None
+shared_faces_state: Dict[int, Dict[str, Any]] = {} 
+# structure: { trk_id: {'box': (x1,y1,x2,y2), 'name': str, 'id': str, 'status': str, 'last_seen': timestamp} }
 
-# --- 1. Model Initialization ---
-# Load YOLOv8 model (used for fast, rough face cropping)
-try:
-    model_yolo = YOLO(YOLO_MODEL_PATH) 
-    print("YOLOv8 model loaded successfully.")
-except Exception as e:
-    print(f"Error loading YOLOv8 model: {e}")
-    model_yolo = None
+# Global Models (Initialized in main function)
+model_yolo = None
+mtcnn = None
+resnet = None
+faiss_index = None
+known_names = []
+known_ids = []
 
-# Load MTCNN (for precise face alignment) and InceptionResnetV1 (FaceNet for embeddings)
-try:
-    # MTCNN is used to detect and align faces before embedding
-    mtcnn = MTCNN(keep_all=True, device='cpu') 
-    # ResNet is the FaceNet backbone used to generate the 512-D embedding vector
-    resnet = InceptionResnetV1(pretrained='vggface2').eval()
-    print("MTCNN and InceptionResnetV1 models loaded successfully.")
-except Exception as e:
-    print(f"Error loading MTCNN/InceptionResnetV1: {e}")
-    mtcnn = None
-    resnet = None
+# --- 1. Database Worker Thread ---
+class DatabaseWorker(threading.Thread):
+    def __init__(self):
+        super().__init__()
+        self.daemon = True # Kill when main exits
+        self.running = True
 
-
-# --- 2. Data Loading & Utility Functions ---
-
-def load_known_embeddings() -> Tuple[Optional[object], List[str], bool]:
-    """
-    Loads known face embeddings and builds a FAISS index for fast nearest-neighbor search.
-    FIX: Ensures KNOWN_NAMES is a flattened list corresponding 1:1 with the FAISS index vectors.
-    Returns: (faiss_index, list_of_names, success_status)
-    """
-    global FAISS_INDEX, KNOWN_NAMES
-    
-    try:
-        with open(EMBEDDINGS_FILE, 'rb') as f:
-            # raw_embeddings: Dict[str, List[np.ndarray]] = {name: [emb1, emb2, ...]}
-            raw_embeddings = pickle.load(f)
-            
-            if not raw_embeddings:
-                print(f"Warning: {EMBEDDINGS_FILE} is empty.")
-                return None, [], False
-
-            # --- CRITICAL FIX START ---
-            all_names: List[str] = [] # List to hold the name for every single embedding
-            all_embeddings: List[np.ndarray] = [] # List to hold every single embedding vector
-
-            for name, embeddings in raw_embeddings.items():
-                for emb in embeddings:
-                    all_names.append(name)
-                    all_embeddings.append(emb)
-            
-            # 2. Convert to a single NumPy matrix (float32 required by FAISS)
-            if not all_embeddings:
-                print(f"Warning: No embeddings found after flattening.")
-                return None, [], False
+    def run(self):
+        print("[Thread] Database Worker Started")
+        while self.running:
+            try:
+                task = db_queue.get(timeout=1)
+                task_type = task[0]
                 
-            embeddings_matrix = np.vstack(all_embeddings).astype('float32')
-            D = embeddings_matrix.shape[1] # Dimension (should be 512)
-            
-            # 3. Initialize FAISS Index (Flat L2 for exact Euclidean distance)
-            index = faiss.IndexFlatL2(D)
-            index.add(embeddings_matrix)
-            
-            # --- CRITICAL FIX END ---
-            
-            print(f"Known embeddings loaded and FAISS index built successfully. ({len(raw_embeddings)} identities, {len(all_names)} total embeddings)")
-            
-            # Store globally for use in the recognition loop
-            FAISS_INDEX = index
-            KNOWN_NAMES = all_names # Now KNOWN_NAMES has the same length as the FAISS index
-            
-            return index, all_names, True
-            
-    except Exception as e:
-        print(f"FATAL: Error loading or building FAISS index from {EMBEDDINGS_FILE}: {e}")
-        return None, [], False
+                if task_type == "mark_attendance":
+                    _, s_id, status = task
+                    self._mark_attendance(s_id, status)
+                elif task_type == "bulk_absent":
+                    self._bulk_absent()
+                
+                db_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[DB Thread Error] {e}")
 
-def get_face_embedding(face_image: np.ndarray, mtcnn_model: object, resnet_model: object) -> Optional[np.ndarray]:
-    """
-    Processes a cropped face image to generate a 512-dimensional embedding vector.
-    """
-    if mtcnn_model is None or resnet_model is None:
-        return None
+    def _mark_attendance(self, student_national_id, status_str):
+        try:
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get internal ID
+            cursor.execute("SELECT id FROM students WHERE national_id = %s LIMIT 1", (student_national_id,))
+            student = cursor.fetchone()
+            
+            if student:
+                internal_id = student['id']
+                today = datetime.now().date()
+                
+                # Check if exists
+                cursor.execute("SELECT id FROM attendance WHERE student_id = %s AND date = %s LIMIT 1", (internal_id, today))
+                if not cursor.fetchone():
+                    insert_sql = "INSERT INTO attendance (student_id, date, status, created_at, updated_at) VALUES (%s, %s, %s, NOW(), NOW())"
+                    cursor.execute(insert_sql, (internal_id, today, status_str))
+                    conn.commit()
+                    print(f"  [DB] Marked {status_str}: {student_national_id}")
+            conn.close()
+        except Exception as e:
+            print(f"  [DB Error] {e}")
+
+    def _bulk_absent(self):
+        try:
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor()
+            today = datetime.now().date()
+            query = """
+                INSERT INTO attendance (student_id, date, status, created_at, updated_at)
+                SELECT id, %s, 'absent', NOW(), NOW()
+                FROM students
+                WHERE id NOT IN (SELECT student_id FROM attendance WHERE date = %s)
+            """
+            cursor.execute(query, (today, today))
+            count = cursor.rowcount
+            conn.commit()
+            conn.close()
+            
+            if count > 0:
+                print(f"\n[SYSTEM] 🕒 Absence Time Reached! Marked {count} remaining students as ABSENT in database.\n")
+            else:
+                print(f"\n[SYSTEM] 🕒 Absence Time Reached! All students accounted for.\n")
+        except Exception as e:
+            print(f"  [DB Error] Bulk Absent: {e}")
+
+# --- 2. Detection Worker Thread ---
+class DetectionWorker(threading.Thread):
+    def __init__(self):
+        super().__init__()
+        self.daemon = True
+        self.running = True
+
+    def run(self):
+        print("[Thread] Detection Worker Started")
+        global shared_latest_frame, model_yolo
         
-    # 1. Convert BGR (OpenCV) to RGB (PyTorch/MTCNN)
-    face_rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
-    
-    # 2. Detect and align the face precisely with MTCNN
-    # MTCNN returns a tensor: [N, C, H, W] where N=1 for a single crop
-    face_tensor = mtcnn_model(face_rgb)
-    
-    if face_tensor is None:
-        return None # No face detected by MTCNN in the cropped area
+        while self.running:
+            # 1. Get latest frame
+            # We access the shared frame directly (read-only access usually okay in Python for opencv images, 
+            # but using lock for safety)
+            frame_to_process = None
+            with state_lock:
+                 if shared_latest_frame is not None:
+                     frame_to_process = shared_latest_frame.copy()
+            
+            if frame_to_process is None:
+                time.sleep(0.01)
+                continue
 
-    # 3. Generate the embedding vector using FaceNet/InceptionResnetV1
-    face_embedding = resnet_model(face_tensor).detach().cpu().numpy().flatten()
-    
-    # Fix for 1024 vs 512 dimension mismatch during live inference
-    expected_dim = 512
-    current_dim = face_embedding.shape[0]
-    
-    if current_dim != expected_dim:
-        if current_dim == 1024 and expected_dim == 512:
-            # Truncate to 512, assuming the embedding is in the first half
-            face_embedding = face_embedding[:expected_dim]
-        else:
-            print(f"FATAL: Embedding size mismatch. Expected {expected_dim}, got {current_dim}. Cannot proceed.")
-            return None
+            # 2. Run YOLO
+            if model_yolo:
+                try:
+                    results = model_yolo(frame_to_process, verbose=False, conf=YOLO_CONFIDENCE_THRESHOLD)
+                    boxes = []
+                    for box in results[0].boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        boxes.append((x1, y1, x2, y2))
+                    
+                    if boxes:
+                        # 3. Send to Recognition Queue
+                        # We send the frame copy along with boxes so recognition runs on the SAME image timestamp
+                        try:
+                            recog_queue.put_nowait((frame_to_process, boxes, time.time()))
+                        except queue.Full:
+                            # If recognition is lagging, drop this detection frame to stay real-time
+                            pass 
+                except Exception as e:
+                    print(f"[Detection Error] {e}")
+            
+            # Small sleep to prevent CPU hogging if YOLO is super fast? 
+            # YOLO usually takes 10-20ms, so natural rate limit exists.
+            time.sleep(0.001)
+
+# --- 3. Recognition Worker Thread ---
+class RecognitionWorker(threading.Thread):
+    def __init__(self):
+        super().__init__()
+        self.daemon = True
+        self.running = True
+        self.local_history = {} # Track ID -> History List
+
+    def run(self):
+        print("[Thread] Recognition Worker Started")
+        global shared_faces_state, mtcnn, resnet, faiss_index, known_names, known_ids
         
-    return face_embedding
+        while self.running:
+            try:
+                # 1. Get Job
+                frame, boxes, timestamp = recog_queue.get(timeout=1)
+                
+                current_updates = {}
+                
+                # 2. Process Boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box
+                    
+                    # Track matching (Associate with previous IDs)
+                    matched_id = self._match_to_history(box)
+                    
+                    # Generate unique ID if new
+                    if matched_id is None:
+                        # Simple unique ID generation
+                        matched_id = int(timestamp * 10000) + (x1+y1)
+                    
+                    # Crop Face
+                    face_crop = frame[y1:y2, x1:x2]
+                    
+                    # Recognition Logic
+                    name = "Unknown"
+                    student_id = None
+                    
+                    if face_crop.size > 0:
+                         emb = self._get_embedding(face_crop)
+                         if emb is not None and faiss_index is not None:
+                             # Search FAISS
+                             search_emb = emb.reshape(1, -1).astype('float32')
+                             D, I = faiss_index.search(search_emb, 1)
+                             idx = I[0][0]
+                             dist = D[0][0]
+                             
+                             if idx != -1 and dist < (RECOGNITION_THRESHOLD ** 2):
+                                 if dist < (STRICT_THRESHOLD ** 2):
+                                     name = known_names[idx]
+                                     student_id = known_ids[idx]
+                    
+                    # Voting / Stability
+                    # We store history in this thread
+                    if matched_id not in self.local_history:
+                        self.local_history[matched_id] = []
+                    
+                    hist = self.local_history[matched_id]
+                    hist.append((name, student_id))
+                    if len(hist) > CONFIRM_FRAMES: hist.pop(0)
+                    
+                    # Determine stable result
+                    stable_name, stable_id = self._determine_stable(hist)
+                    
+                    current_updates[matched_id] = {
+                        'box': box,
+                        'name': stable_name,
+                        'id': stable_id,
+                        'last_seen': time.time()
+                    }
 
-# --- THREADED CAMERA HANDLER FOR STABILITY (User Provided) ---
+                # 3. Update Global State
+                with state_lock:
+                    # Merge logic:
+                    # - Remove very old faces from shared state
+                    # - Update matched ones
+                    now = time.time()
+                    new_state = {}
+                    
+                    # Keep existing valid faces from shared state (that weren't updated in this frame but are still recent)
+                    for trk_id, data in shared_faces_state.items():
+                        if now - data['last_seen'] < 0.5: # Keep for 0.5s
+                            new_state[trk_id] = data
+                    
+                    # Overwrite with new data
+                    new_state.update(current_updates)
+                    
+                    shared_faces_state.clear()
+                    shared_faces_state.update(new_state)
+                
+                recog_queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[Recog Error] {e}")
+
+    def _get_embedding(self, face_img):
+        if mtcnn is None or resnet is None: return None
+        try:
+             face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+             face_tensor = mtcnn(face_rgb)
+             if face_tensor is None: return None
+             emb = resnet(face_tensor.unsqueeze(0).to('cpu')).detach().cpu().numpy().flatten()
+             if emb.shape[0] == 1024: emb = emb[:512]
+             return emb
+        except: return None
+
+    def _match_to_history(self, box):
+        # find closest box in *recent* shared state
+        cx, cy = (box[0]+box[2])/2, (box[1]+box[3])/2
+        best_id = None
+        min_dist = MAX_BOX_DISTANCE
+        
+        # We look at local history or shared state? Shared state is easier as it persists between frames
+        with state_lock:
+            candidates = shared_faces_state.items()
+
+        for trk_id, data in candidates:
+            bx1, by1, bx2, by2 = data['box']
+            bcx, bcy = (bx1+bx2)/2, (by1+by2)/2
+            dist = np.sqrt((cx-bcx)**2 + (cy-bcy)**2)
+            if dist < min_dist:
+                min_dist = dist
+                best_id = trk_id
+        return best_id
+
+    def _determine_stable(self, history):
+        if not history: return "Unknown", None
+        valid = [x for x in history if x[0] != "Unknown"]
+        if not valid: return "Unknown", None
+        counts = {}
+        for n, i in valid: counts[(n,i)] = counts.get((n,i), 0) + 1
+        best = max(counts, key=counts.get)
+        if counts[best] >= REQUIRED_VOTES: return best
+        return "Unknown", None
+
+# --- Camera Handler (Preserved as requested) ---
 class CameraHandler(threading.Thread):
-    """
-    Handles video capture in a separate thread to prevent the main loop from blocking.
-    """
     def __init__(self, stream_url: str):
         super().__init__()
         self.stream_url = stream_url
         self.cap = cv2.VideoCapture(stream_url)
-        
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
-        
         self.frame = None
         self.success = False
         self.stopped = True
         self.lock = threading.Lock()
         
-        if not self.cap.isOpened():
-            print(f"Error: Could not open stream {stream_url}. Check URL or camera status.")
-        else:
+        if self.cap.isOpened():
             self.success, self.frame = self.cap.read()
             self.stopped = False
-            print("CameraHandler started successfully.")
 
     def run(self):
-        """The main thread loop that continuously reads the newest frame."""
         while not self.stopped:
             success, frame = self.cap.read()
-            
             if success:
                 with self.lock:
                     self.frame = frame
@@ -197,447 +343,187 @@ class CameraHandler(threading.Thread):
                 self.success = False
 
     def read(self):
-        """Returns the last successfully read frame and its success status."""
         with self.lock:
             return self.success, self.frame
 
     def stop(self):
-        """Signals the thread to stop and releases the video capture."""
         self.stopped = True
         self.join() 
         self.cap.release()
-        print("CameraHandler stopped.")
 
-
-# --- 3. Consistency Helper Functions ---
-
-# Dictionary to store the recognition history and per-track counters for currently tracked faces
-# Structure now:
-# { face_id: {
-#     'box': (x1, y1, x2, y2),
-#     'history': ['NameA', 'NameA', 'Unknown', ...],
-#     'seen_count': int,             # consecutive frames this face has been seen
-#     'analysis_runs': int,          # how many times we've run the costly embedding+search
-#     'last_recognition': Optional[str]  # last recognition result from an analysis
-#   }
-# }
-face_history: Dict[int, Dict[str, Any]] = {}
-current_face_id: int = 0
-
-def find_nearest_tracked_face(current_box: Tuple[int, int, int, int]) -> Optional[int]:
-    """Finds the ID of the closest tracked face from the previous frame."""
-    global face_history
-    cx_current = (current_box[0] + current_box[2]) / 2
-    cy_current = (current_box[1] + current_box[3]) / 2
-    
-    min_dist = float('inf')
-    matched_id = None
-    
-    for face_id, data in face_history.items():
-        hx1, hy1, hx2, hy2 = data['box']
-        cx_hist = (hx1 + hx2) / 2
-        cy_hist = (hy1 + hy2) / 2
-        
-        # Calculate Euclidean distance between box centers
-        distance = np.sqrt((cx_current - cx_hist)**2 + (cy_current - cy_hist)**2)
-        
-        if distance < min_dist and distance < MAX_BOX_DISTANCE:
-            min_dist = distance
-            matched_id = face_id
+# --- Helper Logic ---
+def load_known_embeddings() -> bool:
+    global faiss_index, known_names, known_ids
+    if not os.path.exists(EMBEDDINGS_FILE): return False
+    try:
+        with open(EMBEDDINGS_FILE, 'rb') as f:
+            raw_data = pickle.load(f)
             
-    return matched_id
-
-def write_to_excel(name, status):
-    """
-    Function to write to the Excel file.
-    """
-    try:
-        for row_idx, row in enumerate(sheet.iter_rows(min_row=2, max_col=1, values_only=True), start=2):
-            if row[0] == name:
-                if name =='none' or name == None or name == 'Unknown' or name == 'Unknown_Unstable':
-                    print(f"Skipping write for unrecognized or invalid name: {name}")
-                    continue
-                # Find the last empty cell in the row
-                col_idx = 2  # Start from the second column (Column B)
-                while sheet.cell(row=row_idx, column=col_idx).value is not None:
-                    col_idx += 1  # Move to the next column
-
-                # Write the status (Late or Absent) with the current date and time
-                sheet.cell(row=row_idx, column=col_idx).value = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {status}"
-                workbook.save('DashBoard.xlsx')
-                print(f"{name} has been recorded as {status} in the Excel file.")
-                break
-    except Exception as e:
-        print(f"Error writing to Excel file: {e}")
-
-def check_absence():
-    """
-    Function to check and record absence for all names not recognized before 9:00 AM.
-    """
-    total = 0
-    marked = 0
-    try:
-        for row_idx, row in enumerate(sheet.iter_rows(min_row=2, max_col=1, values_only=True), start=2):
-            name = row[0]
-            total += 1
-            if name not in recognized_names:
-                marked += 1
-                print(f"{name} is absent.")
-                write_to_excel(name, "Absent")
-        print(f"Absence recorded for {marked} out of {total} names.")
-    except Exception as e:
-        print(f"Error during absence recording: {e}")
-
-
-
-def determine_stable_name(history_list: List[str]) -> str:
-    """Determines the stable name based on the majority vote in the history."""
-    if not history_list:
-        return "Unknown_Unstable"
+        all_embeddings = []
+        names = []
+        ids = []
         
-    counts = {}
-    for name in history_list:
-        counts[name] = counts.get(name, 0) + 1
+        # Handle dict format vs list format
+        if not raw_data: return False
+
+        first = next(iter(raw_data.values()))
+        if isinstance(first, dict): # New format
+             for sid, rec in raw_data.items():
+                 # Support multiple embeddings per student
+                 embs = rec.get('embeddings', [])
+                 if isinstance(embs, list):
+                     for e in embs:
+                         names.append(rec['name'])
+                         ids.append(sid)
+                         all_embeddings.append(e)
+        else: # Old format
+            for name, embs in raw_data.items():
+                for e in embs:
+                    names.append(name)
+                    ids.append(name)
+                    all_embeddings.append(e)
+
+        if not all_embeddings: return False
         
-    # Get the name with the highest count
-    stable_name = max(counts, key=counts.get)
-    
-    if counts[stable_name] >= REQUIRED_VOTES:
-        return stable_name
-    else:
-        # If no single name/identity meets the required votes, it is considered unstable
-        return "Unknown_Unstable"
+        mat = np.vstack(all_embeddings).astype('float32')
+        index = faiss.IndexFlatL2(mat.shape[1])
+        index.add(mat)
+        
+        faiss_index = index
+        known_names = names
+        known_ids = ids
+        print(f"[System] Database loaded: {len(names)} vectors.")
+        return True
+    except Exception as e:
+        print(f"[Error] Loading DB: {e}")
+        return False
 
-
-# --- Time helpers ---
 def parse_time(s: str) -> dtime:
-    """Parse strings like 'HH:MM', 'H' or 'HH' into a datetime.time object.
-    Returns midnight (00:00) on parse failure.
-    """
     try:
-        if s is None:
-            return dtime(hour=0, minute=0)
         s_val = str(s).strip()
         if ':' in s_val:
             parts = s_val.split(':')
             h = int(parts[0]) if parts[0] != '' else 0
             m = int(parts[1]) if len(parts) > 1 and parts[1] != '' else 0
         else:
-            h = int(s_val)
-            m = 0
-
-        h = max(0, min(23, h))
-        m = max(0, min(59, m))
-        return dtime(hour=h, minute=m)
-    except Exception:
+            h = int(s_val); m = 0
+        return dtime(hour=max(0,min(23,h)), minute=max(0,min(59,m)))
+    except:
         return dtime(hour=0, minute=0)
 
-
 def is_time_in_range(start: dtime, end: dtime, now_t: dtime) -> bool:
-    """Return True if now_t is in the half-open interval [start, end),
-    correctly handling intervals that cross midnight."""
-    if start <= end:
-        return start <= now_t < end
-    else:
-        # Interval wraps past midnight (e.g., 22:00 -> 02:00)
-        return now_t >= start or now_t < end
+    if start <= end: return start <= now_t < end
+    else: return now_t >= start or now_t < end
 
-
-# --- 4. Real-Time Recognition Loop ---
-
+# --- Main Entry Point (Called by main.py) ---
 def real_time_face_recognition():
-    global face_history, current_face_id
-
-    # Load time boundaries from config.json (fallbacks provided)
-    def load_times(config_path='config.json'):
-        defaults = {'start_time': '06:00', 'lateness_time': '07:00', 'absence_time': '10:00'}
-        try:
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    cfg = json.load(f)
-                    merged = defaults.copy()
-                    merged.update({k: v for k, v in cfg.items() if k in merged})
-            else:
-                merged = defaults
-        except Exception:
-            merged = defaults
-
-        # Use module-level parse_time helper
-        return parse_time(merged.get('start_time')), parse_time(merged.get('lateness_time')), parse_time(merged.get('absence_time'))
-
-    start_time_obj, lateness_time_obj, absence_time_obj = load_times()
-    print(f"Attendance window: start={start_time_obj}, lateness={lateness_time_obj}, absence={absence_time_obj}")
-    # Track which names we've already printed/recorded to avoid repeats
-    marked_names = set()
-    # Ensure we reference the module-level recognized_names for absence checking
-    global recognized_names
-
-    # Flag to ensure absence is checked only once when the attendance window ends
-    absence_checked = False
-
-    # Load the known embeddings and build the FAISS index
-    faiss_index, known_names, load_success = load_known_embeddings()
+    global model_yolo, mtcnn, resnet, shared_latest_frame
     
-    if not load_success or faiss_index is None:
-        print("Exiting recognition: FAISS index could not be initialized.")
-        return
-
-    # Initialize Camera Handler (IP camera feed)
-    camera = CameraHandler(STREAM_URL)
-    if camera.stopped: # Check if initialization failed
-        return
-    now = datetime.now().time()
-    # Only start the camera loop if the current time is within the attendance window
-    if is_time_in_range(start_time_obj, absence_time_obj, now):
-        camera.start()
-        # Schedule an automatic absence check at the next occurrence of absence_time
+    # 1. Load Settings
+    cfg = {'start_time': '06:00', 'lateness_time': '07:00', 'absence_time': '10:00'}
+    if os.path.exists('config.json'):
         try:
-            now_dt = datetime.now()
-            next_absence_dt = datetime.combine(now_dt.date(), absence_time_obj)
-            if next_absence_dt <= now_dt:
-                next_absence_dt += timedelta(days=1)
-            delay_seconds = (next_absence_dt - now_dt).total_seconds()
-
-            def absence_action():
-                try:
-                    if sheet is not None:
-                        check_absence()
-                        print("Scheduled absence check complete.")
-                except Exception as e:
-                    print(f"Error in scheduled absence action: {e}")
-                # Terminate the process after recording absences to avoid repeated runs
-                try:
-                    camera.stop()
-                except Exception:
-                    pass
-                try:
-                    cv2.destroyAllWindows()
-                except Exception:
-                    pass
-                # Exit now
-                os._exit(0)
-
-            t = threading.Timer(delay_seconds, absence_action)
-            t.daemon = True
-            t.start()
-        except Exception as e:
-            print(f"Warning: failed to schedule absence check: {e}")
-    else:
-        print("Outside of attendance marking hours. Exiting recognition.")
+            with open('config.json') as f: cfg.update(json.load(f))
+        except: pass
+        
+    t_start = parse_time(cfg['start_time'])
+    t_late = parse_time(cfg['lateness_time'])
+    t_abs = parse_time(cfg['absence_time'])
+    
+    print(f"System Running. Rules: Start={t_start}, Late={t_late}, Absent={t_abs}")
+    
+    # 2. Init AI Models
+    try:
+        model_yolo = YOLO(YOLO_MODEL_PATH)
+        mtcnn = MTCNN(keep_all=False, device='cpu')
+        resnet = InceptionResnetV1(pretrained='vggface2').eval()
+        if not load_known_embeddings():
+            print("WARNING: No faces enrolled!")
+    except Exception as e:
+        print(f"FATAL ERROR: AI Init failed: {e}")
         return
+
+    # 3. Start Threads
+    # Camera
+    cam = CameraHandler(STREAM_URL)
+    cam.start()
+    
+    # Workers
+    DatabaseWorker().start()
+    DetectionWorker().start()
+    RecognitionWorker().start()
+    
+    # 4. Main Display Loop
+    print("--- 🚀 High-Performance Multi-Threaded System Started 🚀 ---")
+    
+    local_attendance_cache = set()
+    checked_absence_time = False
     
     try:
-        print("\n--- Starting Real-Time Recognition (Press 'q' to exit) ---")
-        
         while True:
-            success, frame = camera.read()
-            
+            # A. Update Frame from Camera Thread
+            success, frame = cam.read()
             if not success or frame is None:
                 time.sleep(0.01)
                 continue
-
-            # If the attendance window has ended, run absence checks once and exit
-            now = datetime.now().time()
-            if (not absence_checked) and (not is_time_in_range(start_time_obj, absence_time_obj, now)):
-                try:
-                    if sheet is not None:
-                        check_absence()
-                except Exception as e:
-                    print(f"Error running absence check: {e}")
-                absence_checked = True
-                print("Attendance window ended — recorded absences and exiting.")
-                break
-
-            # 1. Use YOLO to detect faces in the current frame
-            yolo_results = model_yolo(frame, verbose=False, conf=YOLO_CONFIDENCE_THRESHOLD) 
+                
+            # Update shared frame for detection thread
+            with state_lock:
+                shared_latest_frame = frame
+                # Snapshot of faces to draw
+                faces_to_draw = shared_faces_state.copy() 
             
-            # Temporary dict to hold associations for the current frame
-            current_frame_detections: Dict[int, Dict[str, Any]] = {}
+            # B. Display Logic (Draw Boxes)
+            display_img = frame.copy()
+            now_time = datetime.now().time()
             
-            for box in yolo_results[0].boxes:
-                # Get bounding box coordinates
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                current_box = (x1, y1, x2, y2)
+            for trk_id, data in faces_to_draw.items():
+                x1, y1, x2, y2 = data['box']
+                name = data['name']
+                sid = data['id']
                 
-                # --- Tracking and History Lookup ---
-                matched_id = find_nearest_tracked_face(current_box)
+                # Default style (Unknown)
+                color = (0, 0, 255)
+                text = "Unknown"
                 
-                if matched_id is None:
-                    # New face detected: assign a new ID
-                    matched_id = current_face_id
-                    current_face_id += 1
-                    # Initialize tracking info for the new face
-                    history_list = []
-                    seen_count = 0
-                    analysis_runs = 0
-                    last_recognition = None
-                else:
-                    # Existing face: retrieve its history and counters
-                    tracked = face_history.get(matched_id, {})
-                    history_list = tracked.get('history', [])
-                    seen_count = tracked.get('seen_count', 0)
-                    analysis_runs = tracked.get('analysis_runs', 0)
-                    last_recognition = tracked.get('last_recognition', None)
-                
-                # Update the temporary tracker for the next iteration
-                # We'll store additional per-track counters in the temp structure
-                current_frame_detections[matched_id] = {
-                    'box': current_box,
-                    'history': history_list,
-                    'seen_count': seen_count,
-                    'analysis_runs': analysis_runs,
-                    'last_recognition': last_recognition
-                }
-                # Per-track seen counter increases because we have a match in this frame
-                current_frame_detections[matched_id]['seen_count'] = seen_count + 1
-
-                # Decide whether to run the costly embedding + FAISS search on THIS frame
-                # Behavior requested:
-                # - Analyze every frame while seen_count < 3 (fast warm-up)
-                # - Once seen_count >= 3, allow up to two analysis runs: first with base threshold,
-                #   then one more with an INCREASED threshold. After those, skip analysis and
-                #   reuse the last recognition to fill the history (votes still required).
-                recognition_result = "Unknown"  # default for this single frame
-                min_distance = float('inf')
-                best_match = None
-
-                # Calculate whether we should analyze this frame
-                sc = current_frame_detections[matched_id]['seen_count']
-                ar = current_frame_detections[matched_id]['analysis_runs']
-                lr = current_frame_detections[matched_id]['last_recognition']
-
-                # Threshold increment used for the second analysis
-                THRESHOLD_INCREMENT = 0.2
-
-                analyze_now = False
-                used_threshold = RECOGNITION_THRESHOLD
-
-                if sc < 3:
-                    # Warm-up: analyze every frame
-                    analyze_now = True
-                    used_threshold = RECOGNITION_THRESHOLD
-                else:
-                    # sc >= 3: allow up to two analysis runs
-                    if ar == 0:
-                        analyze_now = True
-                        used_threshold = RECOGNITION_THRESHOLD  # first post-3 analysis uses base threshold
-                    elif ar == 1:
-                        analyze_now = True
-                        used_threshold = RECOGNITION_THRESHOLD + THRESHOLD_INCREMENT  # second analysis uses increased threshold
-                    else:
-                        analyze_now = False
-
-                face_crop = frame[y1:y2, x1:x2]
-
-                if analyze_now:
-                    embedding = get_face_embedding(face_crop, mtcnn, resnet)
-                    if embedding is not None:
-                        # Reshape for FAISS
-                        query_embedding = embedding.reshape(1, -1).astype('float32')
-                        K = 1
-                        D, I = faiss_index.search(query_embedding, K)
-                        min_distance = D[0][0]
-                        best_match_index = I[0][0]
-                        if best_match_index != -1:
-                            best_match = known_names[best_match_index]
-                        else:
-                            best_match = None
-
-                        # Compare against the (possibly increased) threshold
-                        if best_match is not None and min_distance < (used_threshold ** 2):
-                            recognition_result = best_match
-                        else:
-                            recognition_result = "Unknown"
-                    else:
-                        recognition_result = "Unknown"
-
-                    # Update analysis_runs and last_recognition for this track
-                    current_frame_detections[matched_id]['analysis_runs'] = ar + 1
-                    current_frame_detections[matched_id]['last_recognition'] = recognition_result
-                else:
-                    # Not analyzing this frame: reuse the last recognition result (if any)
-                    if lr is not None:
-                        recognition_result = lr
-                    else:
-                        recognition_result = "Unknown"
-                
-                # Update the history with the single-frame recognition result
-                tracked_entry = current_frame_detections[matched_id]
-                hist = tracked_entry.get('history', [])
-                hist.append(recognition_result)
-                # Keep history bounded
-                if len(hist) > CONFIRM_FRAMES:
-                    hist.pop(0)
-
-                # Write back history in case it's a new list
-                tracked_entry['history'] = hist
-
-                # 5. Determine the STABLE name based on the history (The "Double Check")
-                stable_name = determine_stable_name(hist)
-                display_name = ""
-
-                if stable_name != "Unknown_Unstable":
-                    # Stable match found (green box)
-                    display_name = f"{stable_name} (Stable)"
+                if name != "Unknown":
+                    # Determine Status
                     color = (0, 255, 0)
-
-                    # Determine current status based on loaded schedule
-                    now = datetime.now().time()
-                    status = None
-                    if is_time_in_range(start_time_obj, lateness_time_obj, now):
-                        status = 'Present'
-                    elif is_time_in_range(lateness_time_obj, absence_time_obj, now):
-                        status = 'Late'
-                    else:
-                        status = 'absent'
-
-
-                    # Print and record the first time we see this stable name
-                    if stable_name not in marked_names:
-                        print(f"{stable_name} - {status}")
-                        try:
-                            if sheet is not None:
-                                write_to_excel(stable_name, status)
-                        except Exception:
-                            print(f"Warning: failed to write {stable_name} - {status} to Excel")
-                        marked_names.add(stable_name)
-                        try:
-                            recognized_names.add(stable_name)
-                        except Exception:
-                            pass
-                # 6. Draw the bounding box and name on the frame
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, display_name, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    status = "present"
+                    
+                    if is_time_in_range(t_late, t_abs, now_time):
+                        status = "late"
+                        color = (0, 255, 255)
+                    elif not is_time_in_range(t_start, t_late, now_time): 
+                        # Before start (too early) or after absent
+                        if now_time >= t_abs: status = "absent"
+                        else: status = "early" # purely visual?
+                        if status == "absent": color = (0, 0, 255)
+                    
+                    text = f"{name} [{status.upper()}]"
+                    
+                    # C. Check Enrollment / Mark Attendance
+                    # Only mark if valid ID and not absent and not already marked today
+                    if sid and sid not in local_attendance_cache and status != 'absent' and status != 'early':
+                        db_queue.put(("mark_attendance", sid, status))
+                        local_attendance_cache.add(sid)
+                
+                cv2.rectangle(display_img, (x1,y1), (x2,y2), color, 2)
+                cv2.putText(display_img, text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
-            # Update the global history for the next frame
-            face_history = current_frame_detections
+            # D. Absence Auto-Mark Check
+            if now_time >= t_abs and not checked_absence_time:
+                db_queue.put(("bulk_absent", None, None))
+                checked_absence_time = True
             
-            # Display the result
-            cv2.imshow("Real-Time Face Recognition", frame)
+            # E. Render
+            cv2.imshow("SmartScan Ultra - MultiThreaded", display_img)
             
-            # Exit loop if 'q' is pressed
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
+                
     finally:
-        # Cleanup
-        camera.stop()
+        print("Shutting down...")
+        cam.stop()
         cv2.destroyAllWindows()
-
-
-# --- 5. Main Execution Block ---
-
-if __name__ == "__main__":
-    # Ensure FAISS is available
-    try:
-        import faiss
-    except ImportError:
-        print("FATAL ERROR: FAISS is not installed. Please install it using: pip install faiss-cpu")
-        exit()
-    if model_yolo is None or mtcnn is None or resnet is None:
-        print("\nExiting: Critical models failed to load. Please check model paths and dependencies.")
-    else:
-        # Run the real-time recognition loop
-        real_time_face_recognition()
-
-    print("\nApplication terminated.")
+        # Daemon threads will terminate automatically
