@@ -25,7 +25,7 @@ STRICT_THRESHOLD = 1.0       # Relaxed
 YOLO_CONFIDENCE_THRESHOLD = 0.70
 
 # --- Temporal Consistency Settings ---
-CONFIRM_FRAMES = 3
+CONFIRM_FRAMES = 2
 REQUIRED_VOTES = 1 # Instant match
 MAX_BOX_DISTANCE = 100
 
@@ -437,7 +437,7 @@ def real_time_face_recognition():
                         else: status="early"
                     txt = f"{name} [{status.upper()}]"
                     
-                    if sid and (sid not in local_cache) and (status not in ['absent', 'early']):
+                    if sid and (sid not in local_cache) and (status != 'early'):
                         db_queue.put(("mark_attendance", sid, status))
                         local_cache.add(sid)
 
@@ -460,14 +460,17 @@ def real_time_face_recognition():
                 if not abs_checked:
                     db_queue.put(("bulk_absent", None, None))
                     abs_checked = True
-                
-                # Stop recording at absence time
-                if is_recording:
-                    print("[Recording] Absence Time Reached. Stopping Video.")
-                    is_recording = False
-                    if video_writer:
-                        video_writer.release()
+                    
+                    # Stop recording at absence time
+                    if is_recording:
+                        print("[Recording] Absence Time Reached. Stopping Video.")
+                        is_recording = False
+                        if video_writer: video_writer.release()
                         video_writer = None
+                    
+                    print("[SYSTEM] Closing system in 3 seconds...")
+                    time.sleep(3)
+                    break # Exit Main Loop
 
             cv2.imshow("SmartScan Ultra", display)
             if cv2.waitKey(1) == ord('q'): break
