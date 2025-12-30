@@ -5,6 +5,7 @@ import threading
 import queue
 import torch
 import faiss
+import faiss
 from facenet_pytorch import MTCNN, InceptionResnetV1
 from ultralytics import YOLO
 import pickle

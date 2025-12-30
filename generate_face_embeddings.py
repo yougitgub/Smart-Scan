@@ -2,213 +2,376 @@ import os
 import cv2
 import pickle
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-import importlib
+import argparse
+import tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime
+import sys
+import subprocess
 
-# Dynamically import heavy optional packages to avoid static linter errors
+# --- Imports & Models --- #
 try:
-    torch = importlib.import_module('torch')
-except Exception:
-    torch = None
+    import torch
+    from facenet_pytorch import MTCNN, InceptionResnetV1
+    from ultralytics import YOLO
+    from PIL import Image, ImageTk  # for displaying images in GUI
+    import mysql.connector # Mysql Connection
+except ImportError as e:
+    print(f"[ERROR] Missing library: {e}", file=sys.stderr)
+    if __name__ == "__main__":
+        sys.exit(1)
+    else:
+        # Fallback for gui import
+        torch = None; MTCNN = None; InceptionResnetV1 = None; YOLO = None; Image = None; ImageTk = None
 
-MTCNN = None
-InceptionResnetV1 = None
-try:
-    facenet_module = importlib.import_module('facenet_pytorch')
-    MTCNN = getattr(facenet_module, 'MTCNN', None)
-    InceptionResnetV1 = getattr(facenet_module, 'InceptionResnetV1', None)
-except Exception:
-    facenet_module = None
-
-YOLO = None
-try:
-    ultralytics_module = importlib.import_module('ultralytics')
-    YOLO = getattr(ultralytics_module, 'YOLO', None)
-except Exception:
-    ultralytics_module = None
-
-# --- Configuration ---
+# Configuration
 KNOWN_EMBEDDINGS_FILE = 'known_embeddings.pkl'
-ENROLLMENT_DIRECTORY = "students" # Directory containing images named by student (non-recursive)
-RECOGNITION_THRESHOLD = 0.7 # Similarity score threshold for a match (adjust as needed)
+ENROLLMENT_DIRECTORY = "students" 
+if torch:
+    DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+else:
+    DEVICE = 'cpu'
 
-# Initialize YOLOv8 model for initial face detection (bounding box)
-model = None
-if YOLO is not None:
+# Laravel DB Config
+DB_CONFIG = {
+    'host': '127.0.0.1',
+    'port': 3306,
+    'user': 'root',
+    'password': '', 
+    'database': 'system'
+}
+
+# 1. Load YOLO (Face Detection)
+YOLO_MODEL = None
+if YOLO:
     try:
-        # Assuming 'detection/weights/yolov12n-best.pt' is available in your environment
-        model = YOLO("detection/weights/yolov12n-best.pt")
-        print("YOLOv8 model loaded successfully.")
+        weights = "detection/weights/yolov12n-face.pt"
+        if not os.path.exists(weights):
+            weights = "detection/weights/yolov12n-best.pt"
+        
+        YOLO_MODEL = YOLO(weights)
+        print(f"[TECH] YOLO loaded: {weights}", file=sys.stderr)
     except Exception as e:
-        print(f"Error loading YOLOv8 model: {e}")
-else:
-    print("Warning: ultralytics.YOLO is not available. YOLO-based detection will be disabled.")
+        print(f"[TECH] YOLO Warning: {e}", file=sys.stderr)
 
-# Initialize MTCNN for precise face alignment/cropping and InceptionResnetV1 for embedding
-if torch is not None:
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-else:
-    device = 'cpu'
-    print("Warning: torch is not available. Using fallback device string 'cpu'.")
-
-# Initialize MTCNN and ResNet only if facenet_pytorch is available
+# 2. Load FaceNet (Embeddings)
 mtcnn = None
 resnet = None
-if MTCNN is not None and InceptionResnetV1 is not None and torch is not None:
+if MTCNN and InceptionResnetV1:
     try:
         mtcnn = MTCNN(
             image_size=160, margin=0, min_face_size=20,
             thresholds=[0.6, 0.7, 0.7], factor=0.709, post_process=True,
-            device=device
+            keep_all=False, device=DEVICE
         )
-        resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-        print("MTCNN and InceptionResnetV1 models loaded successfully.")
+        resnet = InceptionResnetV1(pretrained='vggface2').eval().to(DEVICE)
+        print("[TECH] FaceNet models loaded.", file=sys.stderr)
     except Exception as e:
-        print(f"Error initializing MTCNN/ResNet: {e}")
-else:
-    print("Warning: facenet_pytorch is not available. Face embedding generation will be disabled.")
+        print(f"[TECH] FaceNet Error: {e}", file=sys.stderr)
+        if __name__ == "__main__":
+            sys.exit(1)
 
-# Load known embeddings
-KNOWN_EMBEDDINGS: Dict[str, List[np.ndarray]] = {}
-try:
-    with open(KNOWN_EMBEDDINGS_FILE, 'rb') as f:
-        # Load the structure {name: [embedding1, embedding2, ...]}
-        KNOWN_EMBEDDINGS = pickle.load(f)
-        print(f"Known embeddings loaded successfully ({len(KNOWN_EMBEDDINGS)} unique people).")
-except FileNotFoundError:
-    print("No known embeddings file found. Starting with an empty dictionary.")
-except Exception as e:
-    print(f"Error loading embeddings file: {e}. Starting with an empty dictionary.")
+# --- Core Logic --- #
 
+def get_php_bcrypt_hash(password):
+    """ Use local PHP to generate a Bcrypt hash compatible with Laravel """
+    try:
+        cmd = ['php', '-r', f"echo password_hash('{password}', PASSWORD_BCRYPT);"]
+        
+        if sys.platform == 'win32':
+             hash_str = subprocess.check_output(cmd, shell=True).decode('utf-8').strip()
+        else:
+             hash_str = subprocess.check_output(cmd).decode('utf-8').strip()
+             
+        return hash_str
+    except Exception as e:
+        print(f"[TECH] Password hashing failed: {e}", file=sys.stderr)
+        return password 
 
-def get_face_embedding(face_image: np.ndarray) -> Optional[np.ndarray]:
+def sync_to_mysql(national_id, name, year, classroom):
+    """ Inserts or Updates student info in the Laravel MySQL DB """
+    if 'mysql.connector' not in sys.modules:
+        return
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        
+        # 1. HANDLE PARENT USER
+        cursor.execute("SELECT id FROM users WHERE username = %s LIMIT 1", (national_id,))
+        parent = cursor.fetchone()
+        
+        parent_id = None
+        if parent:
+            parent_id = parent['id']
+            print(f"[TECH] Parent account exists (ID: {parent_id})", file=sys.stderr)
+        else:
+            # Create Parent
+            hashed_pw = get_php_bcrypt_hash("password123")
+            parent_name = f"Parent of {name}"
+            parent_email = f"parent_{national_id}@smartscan.com"
+            
+            insert_user_sql = """
+                INSERT INTO users (username, name, email, password, role, must_change_password, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'parent', 1, NOW(), NOW())
+            """
+            cursor.execute(insert_user_sql, (national_id, parent_name, parent_email, hashed_pw))
+            parent_id = cursor.lastrowid
+            print(f"✓ Created parent account for {name}")
+            
+        # 2. UPSERT STUDENT
+        query = """
+        INSERT INTO students (national_id, full_name, year, class, parent_id, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+        ON DUPLICATE KEY UPDATE
+        full_name = VALUES(full_name),
+        year = VALUES(year),
+        class = VALUES(class),
+        parent_id = VALUES(parent_id),
+        updated_at = NOW()
+        """
+        
+        cursor.execute(query, (national_id, name, year, classroom, parent_id))
+        conn.commit()
+        conn.close()
+        print(f"✓ Synced {name} to database")
+        
+    except Exception as e:
+        print(f"[TECH] MySQL Sync Error: {e}", file=sys.stderr)
+
+def get_face_embedding(image_rgb):
     """
-    Takes a detected face image (cropped by YOLO) and processes it with MTCNN/FaceNet
-    to get the 512-dimensional embedding vector. Returns a NumPy array.
+    Generate embedding from an image (crop or full).
+    Input: RGB NumPy array.
     """
     if mtcnn is None or resnet is None:
         return None
-        
+
     try:
-        # Check if the image is grayscale (shape only has 2 dimensions) and convert to 3-channel
-        if len(face_image.shape) == 2:
-            face_image = cv2.cvtColor(face_image, cv2.COLOR_GRAY2BGR)
+        # 1. Try MTCNN to detect/align/normalize
+        face_tensor = mtcnn(image_rgb)
         
-        # 1. MTCNN detects the face again (optional, but ensures alignment) and converts to Tensor
-        # NOTE: MTCNN expects an RGB image (default behavior of facenet_pytorch)
-        face_rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
-        face_tensor = mtcnn(face_rgb)
-        
+        # 2. Fallback: If MTCNN returns None (no face detected/aligned), 
+        # MANUAL FALLBACK: Just resize the image, assume it IS a face crop.
         if face_tensor is None:
-            return None
-
-        # 2. Add batch dimension and move to device
-        # Ensure tensor shape is correct: [1, 3, 160, 160]
-        face_tensor = face_tensor.unsqueeze(0).to(device)
+            # Resize
+            img_resized = cv2.resize(image_rgb, (160, 160))
+            # To Tensor: HxWxC -> CxHxW
+            face_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float()
+            # Normalize fixed (standard Inception normalization)
+            face_tensor = (face_tensor - 127.5) / 128.0
         
-        # 3. Get the 512-D embedding
+        # 3. Generate Vector
+        if face_tensor.ndim == 3:
+            face_tensor = face_tensor.unsqueeze(0) # Add batch dim
+            
+        face_tensor = face_tensor.to(DEVICE)
+        
         with torch.no_grad():
-            embedding = resnet(face_tensor)
-
-        # Ensure the final output is a NumPy array
-        return embedding.detach().cpu().numpy()
+            emb = resnet(face_tensor)
+            
+        return emb.detach().cpu().numpy().flatten()
         
     except Exception as e:
-        # --- CRITICAL CHANGE: Print the error to debug the root cause ---
-        print(f"--- ERROR IN EMBEDDING GENERATION: {e} ---")
+        print(f"[TECH] Embedding error: {e}", file=sys.stderr)
         return None
 
+def show_gui(name, n_id, image_path=None):
+    """ Simple blocking popup for Year/Class with Image Preview """
+    try:
+        root = tk.Tk()
+        root.title("Student Info")
+        # Center - slightly taller to accommodate image
+        root.geometry(f"300x420+{int(root.winfo_screenwidth()/2-150)}+{int(root.winfo_screenheight()/2-210)}")
+        
+        res = {'y': None, 'c': None, 'ok': False}
+        
+        # --- Image Preview ---
+        if image_path and os.path.exists(image_path) and Image:
+            try:
+                pil_img = Image.open(image_path)
+                # Resize to fit (e.g., 150x150 max) keeping aspect ratio
+                pil_img.thumbnail((150, 150))
+                tk_img = ImageTk.PhotoImage(pil_img)
+                
+                img_lbl = ttk.Label(root, image=tk_img)
+                img_lbl.image = tk_img # Keep reference!
+                img_lbl.pack(pady=10)
+            except Exception as e:
+                print(f"[TECH] Image Preview Error: {e}", file=sys.stderr)
+                
+        ttk.Label(root, text=name, font=("Arial", 12, "bold")).pack(pady=5)
+        ttk.Label(root, text=n_id, font=("Arial", 10)).pack(pady=5)
+        
+        ttk.Label(root, text="Year:").pack()
+        y_var = ttk.Combobox(root, values=["1","2","3"], state="readonly")
+        y_var.pack()
+        
+        ttk.Label(root, text="Class:").pack()
+        c_var = ttk.Combobox(root, values=[f"{l}-{n}" for l in "ABCDEF" for n in range(1, 11)], state="readonly")
+        c_var.pack()
+        
+        def save():
+            if y_var.get() and c_var.get():
+                res.update({'y': int(y_var.get()), 'c': c_var.get(), 'ok': True})
+                root.destroy()
+        
+        ttk.Button(root, text="Save", command=save).pack(pady=10)
+        
+        # Bring to front
+        root.lift()
+        root.attributes('-topmost', True)
+        root.after_idle(root.attributes, '-topmost', False)
+        
+        root.mainloop()
+        return (res['y'], res['c']) if res['ok'] else (None, None)
+    except Exception as e:
+        print(f"[TECH] GUI Error: {e}", file=sys.stderr)
+        return None, None
+
 def generate_known_embeddings(directory_path: str):
-    """
-    Processes images directly inside the given directory (non-recursive) and saves the
-    generated embeddings. Each image's filename (without extension) is used as the
-    person's name. Structure: students/PersonName.jpg
-    """
-    if not os.path.isdir(directory_path):
-        print(f"Error: '{directory_path}' is not a valid directory.")
+    """ Wrapper for external calls """
+    main_logic(enroll=False, on_exist='skip', directory=directory_path)
+
+def main_logic(enroll=False, on_exist='skip', directory=ENROLLMENT_DIRECTORY):
+    print(f"━━━ Enrollment Mode: {on_exist.upper()} ━━━")
+    interactive = enroll
+    
+    # Load DB
+    db = {}
+    if os.path.exists(KNOWN_EMBEDDINGS_FILE):
+        try:
+            with open(KNOWN_EMBEDDINGS_FILE, 'rb') as f:
+                db = pickle.load(f)
+                if db and isinstance(list(db.values())[0], list): db = {} # Reset if old format
+        except: db = {}
+
+    if not os.path.exists(directory):
+        print(f"❌ Directory '{directory}' not found.")
         return
 
-    updated_embeddings = 0
-
-    # List only files directly inside the directory (no subfolders)
-    for filename in os.listdir(directory_path):
-        file_path = os.path.join(directory_path, filename)
-
-        # Skip directories and non-image files
-        if not os.path.isfile(file_path):
-            continue
-
-        if not filename.lower().endswith(('.jpg', '.png', '.bmp', '.jpeg')):
-            continue
-
-        # Use the filename (without extension) as the person's name
-        name, _ext = os.path.splitext(filename)
-        person_embeddings: List[np.ndarray] = []
-        print(f"--- Processing image '{filename}' for student '{name}'... ---")
-
-        img = cv2.imread(file_path)
-        if img is None:
-            print(f"Error: Unable to read image '{file_path}'.")
-            continue
-
-        # 1. YOLOv8 for initial detection
-        # Note: If YOLO is failing here, no embeddings will be generated either.
-        try:
-            results = model(img, verbose=False)
-            boxes = results[0].boxes # Boxes object from ultralytics
-        except Exception as e:
-            print(f"Error during YOLO detection for '{filename}': {e}")
-            continue
-
-        # Check if no boxes detected
-        if boxes is None or len(boxes) == 0:
-            print(f"Notice: No faces detected in '{filename}'.")
-            continue
-
-        # Convert box coordinates to numpy array (N x 4 or N x 6) and iterate rows
-        xyxy = boxes.xyxy
-        if hasattr(xyxy, 'cpu'):
-            xyxy = xyxy.cpu().numpy()
-
-        for xy in xyxy:
-            x1, y1, x2, y2 = [int(val) for val in xy[:4]]
-            face_crop = img[y1:y2, x1:x2]
-
-            # Check if crop is valid
-            if face_crop.shape[0] == 0 or face_crop.shape[1] == 0:
-                print(f"Warning: Invalid face crop dimensions for face in '{filename}'.")
+    # Process
+    count = 0
+    total_students = sum(1 for s in os.listdir(directory) if os.path.isdir(os.path.join(directory, s)))
+    current = 0
+    
+    for student in os.listdir(directory):
+        s_path = os.path.join(directory, student)
+        if not os.path.isdir(s_path): continue
+        
+        current += 1
+        
+        for file in os.listdir(s_path):
+            if not file.lower().endswith(('.jpg', '.png', '.jpeg')): continue
+            
+            f_path = os.path.join(s_path, file)
+            sid, _ = os.path.splitext(file) # ID is filename
+            
+            # --- 1. SKIP CHECK ---
+            if sid in db and on_exist == 'skip':
+                 print(f"⏭  Skipped: {student} (already enrolled)")
+                 print(f"[TECH] Student {sid} exists in DB, policy=skip", file=sys.stderr)
+                 continue
+            
+            print(f"[{current}/{total_students}] Processing {student}...", end='')
+            print(f"\n[TECH] Processing file: {f_path}", file=sys.stderr)
+            
+            # Read
+            img = cv2.imread(f_path)
+            if img is None: 
+                print(" ❌ Read Error")
+                continue
+                
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            embeddings = []
+            
+            # 2. Detect & Generate
+            crops = []
+            if YOLO_MODEL:
+                try:
+                    res = YOLO_MODEL(img, verbose=False)
+                    if res and len(res[0].boxes) > 0:
+                        for box in res[0].boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0].cpu())
+                            h, w, _ = img.shape
+                            crop = img_rgb[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                            crops.append(crop)
+                        print(f"[TECH] YOLO found {len(crops)} face(s)", file=sys.stderr)
+                except Exception as e:
+                    print(f"[TECH] YOLO detection failed: {e}", file=sys.stderr)
+            
+            if crops:
+                for crop in crops:
+                    if crop.size > 0:
+                        v = get_face_embedding(crop)
+                        if v is not None: embeddings.append(v)
+            else:
+                 # YOLO failed -> full Image
+                 print(f"[TECH] No YOLO detections, using full image", file=sys.stderr)
+                 v = get_face_embedding(img_rgb)
+                 if v is not None: embeddings.append(v)
+            
+            if not embeddings:
+                print(" ❌ No Face Found")
                 continue
 
-            # 2. Get the FaceNet embedding (returns a NumPy array)
-            embedding_tensor = get_face_embedding(face_crop)
-
-            if embedding_tensor is not None:
-                # embedding_tensor is already a NumPy array, so remove .numpy()
-                person_embeddings.append(embedding_tensor.flatten())
-                updated_embeddings += 1
+            # 3. Store in DB
+            if sid not in db:
+                db[sid] = {'name': student, 'embeddings': [], 'year': None, 'class': None}
+            
+            # Update Embeddings Logic
+            if on_exist == 'replace': 
+                db[sid]['embeddings'] = embeddings
+            elif on_exist == 'append':
+                db[sid]['embeddings'].extend(embeddings)
             else:
-                print(f"Warning: Could not get embedding for face in '{filename}'.")
-
-        if person_embeddings:
-            # If name already exists, extend the embeddings list, otherwise set new
-            if name in KNOWN_EMBEDDINGS:
-                KNOWN_EMBEDDINGS[name].extend(person_embeddings)
+                pass 
+            
+            print(f" ✓ {len(embeddings)} face vector(s)")
+            count += 1
+            
+            # 4. Interactive GUI (Input Year/Class)
+            if interactive:
+                current_y = db[sid].get('year')
+                current_c = db[sid].get('class')
+                
+                # Force GUI if info missing OR strategy is REPLACE
+                should_ask = (current_y is None or current_c is None) or (on_exist == 'replace')
+                
+                if should_ask:
+                    print(f"  ⏸  Waiting for user input...")
+                    y, c = show_gui(student, sid, image_path=f_path)
+                    if y: 
+                        db[sid]['year'] = y
+                        db[sid]['class'] = c
+                        print(f"  ✓ Details saved: Year {y}, Class {c}")
+                        sync_to_mysql(sid, student, y, c)
+                    else:
+                         print(f"  ⏭  Skipped (cancelled)")
+                else:
+                    print(f"[TECH] Metadata exists, skipping GUI", file=sys.stderr)
+                    sync_to_mysql(sid, student, current_y, current_c)
             else:
-                KNOWN_EMBEDDINGS[name] = person_embeddings
+                # Non-interactive Mode Sync
+                y = db[sid].get('year')
+                c = db[sid].get('class')
+                if y and c:
+                     sync_to_mysql(sid, student, y, c)
 
-            print(f"SUCCESS: Saved {len(person_embeddings)} embeddings for '{name}'.")
-        else:
-            print(f"NOTICE: No embeddings found for '{name}' from image '{filename}'.")
 
-    # Save the updated embeddings dictionary
-    if updated_embeddings > 0:
-        try:
-            with open(KNOWN_EMBEDDINGS_FILE, 'wb') as f:
-                pickle.dump(KNOWN_EMBEDDINGS, f)
-            print(f"\n--- Enrollment Complete: Saved {len(KNOWN_EMBEDDINGS)} unique people to '{KNOWN_EMBEDDINGS_FILE}'. ---")
-        except Exception as e:
-            print(f"FATAL ERROR: Failed to save embeddings file: {e}")
+    if count > 0:
+        with open(KNOWN_EMBEDDINGS_FILE, 'wb') as f:
+            pickle.dump(db, f)
+        print(f"\n━━━ Complete! Processed {count} student(s) ━━━")
     else:
-        print("\n--- Enrollment Complete: No new embeddings were generated. ---")
+        print(f"\n━━━ No changes made ━━━")
 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--enroll', default='false')
+    parser.add_argument('--on-exist', default='skip')
+    args = parser.parse_args()
+    
+    main_logic(enroll=(args.enroll.lower() =='true'), on_exist=args.on_exist)
+
+if __name__ == "__main__":
+    main()
