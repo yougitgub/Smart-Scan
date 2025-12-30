@@ -20,14 +20,14 @@ EMBEDDINGS_FILE = 'known_embeddings.pkl'
 STREAM_URL = 'rtsp://admin:1234qwer@@192.168.1.18:554/Streaming/Channels/102?tcp'
 
 # --- THRESHOLDS ---
-RECOGNITION_THRESHOLD = 1.1
-STRICT_THRESHOLD = 0.85
-YOLO_CONFIDENCE_THRESHOLD = 0.75
+RECOGNITION_THRESHOLD = 0.95  # Relaxed
+STRICT_THRESHOLD = 1.0       # Relaxed
+YOLO_CONFIDENCE_THRESHOLD = 0.70
 
 # --- Temporal Consistency Settings ---
-CONFIRM_FRAMES = 1
-REQUIRED_VOTES = 1
-MAX_BOX_DISTANCE = 50
+CONFIRM_FRAMES = 3
+REQUIRED_VOTES = 1 # Instant match
+MAX_BOX_DISTANCE = 100
 
 # --- MySQL Config ---
 DB_CONFIG = {
@@ -40,9 +40,8 @@ DB_CONFIG = {
 
 # --- Shared Resources ---
 db_queue = queue.Queue()
-recog_queue = queue.Queue(maxsize=1) 
+recog_queue = queue.Queue(maxsize=2) # Increased buffer slightly 
 state_lock = threading.Lock()
-
 # fast_state: Updated by Detection Thread (High FPS) -> [(x1,y1,x2,y2), ...]
 shared_detected_boxes = []
 shared_detected_ts = 0
@@ -183,6 +182,9 @@ class DetectionWorker(threading.Thread):
                         x1,y1,x2,y2 = map(int, box.xyxy[0])
                         boxes.append((x1,y1,x2,y2))
                     
+                    if boxes:
+                        print(f"[YOLO] Found {len(boxes)} faces") # LOGGING
+
                     # FAST PATH UPDATE
                     with state_lock:
                         shared_detected_boxes = boxes
@@ -209,77 +211,126 @@ class RecognitionWorker(threading.Thread):
         while self.running:
             try:
                 frame, boxes, ts = recog_queue.get(timeout=1)
-                
-                # Simple ID Matcher for continuity
-                # We map current boxes to identities
-                for box in boxes:
-                    x1,y1,x2,y2 = box
-                    # Unique-ish ID for this frame's box (Position-based)
-                    # We need a stable ID to track history. 
-                    # Simpler strategy: Just compute closest match in history.
-                    
-                    bx_center = ((x1+x2)//2, (y1+y2)//2)
-                    
-                    # 1. AI Recognition
-                    name = "Unknown"; sid = None
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        emb = self._get_emb(crop)
-                        if emb is not None and faiss_index is not None:
-                            D, I = faiss_index.search(emb.reshape(1,-1), 1)
-                            if I[0][0] != -1 and D[0][0] < RECOGNITION_THRESHOLD**2:
-                                if D[0][0] < STRICT_THRESHOLD**2:
-                                    name = known_names[I[0][0]]
-                                    sid = known_ids[I[0][0]]
-
-                    # 2. Update Shared Identity Map
-                    with state_lock:
-                        # Key = approximate center (quantized to allow slight movement)
-                        # Actually, detection jitter makes spatial keys hard.
-                        # BETTER: We just store a list of identified faces, 
-                        # and Main Thread matches visually closest box.
-                        
-                        # Pruning old keys happens by creating a fresh dict based on current detections
-                        pass 
-
-                # Re-think: Recog thread usually lags.
-                # It should update a "Confirmed Identity" list: [(box, name, id, ts), ...]
-                
                 confirmed = []
+                
+                # Prune old history
+                now = time.time()
+                self.history = {k:v for k,v in self.history.items() if isinstance(v, dict) and now - v.get('last_seen', 0) < 2.0}
+
                 for box in boxes:
                     x1,y1,x2,y2 = box
-                    crop = frame[y1:y2, x1:x2]
+                    # Clamp
+                    h, w = frame.shape[:2]
+                    x1=max(0,x1); y1=max(0,y1); x2=min(w,x2); y2=min(h,y2)
+                    
+                    # 1. Coordinate Matching for History
+                    cx, cy = (x1+x2)//2, (y1+y2)//2
+                    track_id = self._match_history(cx, cy)
+                    
+                    if track_id is None:
+                        track_id = now + (cx/10000.0)
+                        self.history[track_id] = {'votes': [], 'last_seen': now, 'last_center': (cx, cy)}
+
+                    # Safety Check
+                    if not isinstance(self.history[track_id], dict):
+                         self.history[track_id] = {'votes': [], 'last_seen': now, 'last_center': (cx, cy)}
+
+                    self.history[track_id]['last_seen'] = now
+                    self.history[track_id]['last_center'] = (cx, cy)
+
+                    # 2. Recognition
                     name="Unknown"; sid=None
+                    crop = frame[y1:y2, x1:x2]
+                    
                     if crop.size > 0:
                         emb = self._get_emb(crop)
                         if emb is not None and faiss_index is not None:
                             D, I = faiss_index.search(emb.reshape(1,-1), 1)
-                            if I[0][0]!=-1 and D[0][0] < RECOGNITION_THRESHOLD**2:
-                                if D[0][0] < STRICT_THRESHOLD**2:
-                                    name = known_names[I[0][0]]
-                                    sid = known_ids[I[0][0]]
-                    confirmed.append({'box': box, 'name': name, 'id': sid, 'ts': time.time()})
+                            dist = D[0][0]
+                            idx = I[0][0]
+                            threshold = RECOGNITION_THRESHOLD**2
+                            
+                            print(f"  > [Recog] Dist={dist:.4f} vs Thresh={threshold:.4f}")
+
+                            if idx != -1 and dist < threshold:
+                                if dist < STRICT_THRESHOLD**2:
+                                    name = known_names[idx]
+                                    sid = known_ids[idx]
+                                    print(f"    ✅ RAW MATCH: {name}")
+                                else:
+                                    print(f"    ⚠️  AMBIGUOUS: {known_names[idx]}")
+
+                    # 3. Voting / Temporal Consistency
+                    try:
+                        votes = self.history[track_id].get('votes', [])
+                        if not isinstance(votes, list): votes = []
+                        
+                        votes.append((name, sid))
+                        if len(votes) > CONFIRM_FRAMES: votes.pop(0)
+                        self.history[track_id]['votes'] = votes # Ensure saved back
+
+                        # Tally votes
+                        valid_votes = [v for v in votes if v[0] != "Unknown"]
+                        final_name = "Unknown"; final_id = None
+                        
+                        if len(valid_votes) >= REQUIRED_VOTES:
+                            from collections import Counter
+                            # valid_votes is list of tuples: [('Name', 'ID'), ...]
+                            counts = Counter(valid_votes)
+                            if counts:
+                                (best_name, best_id), count = counts.most_common(1)[0]
+                                if count >= REQUIRED_VOTES:
+                                    final_name, final_id = best_name, best_id
+                                    print(f"    🏆 CONFIRMED: {final_name}")
+                        
+                        confirmed.append({'box': box, 'name': final_name, 'id': final_id, 'ts': time.time()})
+                    except Exception as e:
+                        print(f"    [Voting Error] {e}")
+                        confirmed.append({'box': box, 'name': "Unknown", 'id': None, 'ts': time.time()})
                 
                 with state_lock:
                     shared_identities.update({id(box): c for box, c in zip(boxes, confirmed)})
-                    # Clean old entries
                     now = time.time()
-                    shared_identities = {k:v for k,v in shared_identities.items() if now - v['ts'] < 1.0}
-                    # Also, we need a spatial map, not ID map. 
-                    # Let's just store the list of confirmed faces.
-                    shared_identities['latest_list'] = confirmed
+                    
+                    # Safe Pruning Logic (Avoids crashing on 'latest_list' which is a list, not dict)
+                    clean_state = {}
+                    for k, v in shared_identities.items():
+                        if k == 'latest_list': continue # Skip, we update it below
+                        if isinstance(v, dict) and (now - v.get('ts', 0) < 1.0):
+                            clean_state[k] = v
+                    
+                    clean_state['latest_list'] = confirmed
+                    shared_identities = clean_state 
 
                 recog_queue.task_done()
             except queue.Empty: continue
-            except: pass
+            except Exception as e: print(f"Recog Worker Loop Error: {e}")
+
+    def _match_history(self, cx, cy):
+        best_id = None; min_dist = MAX_BOX_DISTANCE
+        for tid, data in self.history.items():
+            if 'last_center' in data:
+                lcx, lcy = data['last_center']
+                dist = np.sqrt((cx-lcx)**2 + (cy-lcy)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_id = tid
+        
+        return best_id
 
     def _get_emb(self, img):
         if not mtcnn or not resnet: return None
         try:
-             t = mtcnn(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-             if t is None: return None
-             e = resnet(t.unsqueeze(0).to('cpu')).detach().cpu().numpy().flatten()
-             return e[:512] if e.shape[0]==1024 else e
+             face_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+             t = mtcnn(face_rgb)
+             if t is None:
+                 resized = cv2.resize(face_rgb, (160, 160))
+                 t = torch.from_numpy(resized).permute(2, 0, 1).float()
+                 t = (t - 127.5) / 128.0
+             if t is not None:
+                 e = resnet(t.unsqueeze(0).to('cpu')).detach().cpu().numpy().flatten()
+                 return e[:512] if e.shape[0]==1024 else e
+             return None
         except: return None
 
 # --- Load Utilities ---
@@ -324,7 +375,7 @@ def real_time_face_recognition():
         mtcnn = MTCNN(keep_all=False, device='cpu')
         resnet = InceptionResnetV1(pretrained='vggface2').eval()
         load_db()
-    except E: print(f"Init Error: {E}"); return
+    except Exception as E: print(f"Init Error: {E}"); return
 
     cam = CameraHandler(STREAM_URL); cam.start()
     DatabaseWorker().start(); DetectionWorker().start(); RecognitionWorker().start()
@@ -348,8 +399,9 @@ def real_time_face_recognition():
                 # GET FAST BOXES
                 cur_boxes = shared_detected_boxes[:]
                 cur_ts = shared_detected_ts
-                # GET SLOW NAMES
-                cur_identities = shared_identities.get('latest_list', [])
+                # GET SLOW NAMES (Use Memory Dict, not just latest snapshot)
+                cur_identities = [v for k,v in shared_identities.items() if k != 'latest_list']
+
 
             display = frame.copy()
             now = datetime.now().time()
@@ -398,8 +450,8 @@ def real_time_face_recognition():
                     h, w = display.shape[:2]
                     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                     filepath = os.path.join(rec_dir, f"session_{timestamp}.avi")
-                    # XVID is widely compatible. 20.0 FPS is a safe assumption for playback speed.
-                    video_writer = cv2.VideoWriter(filepath, cv2.VideoWriter_fourcc(*'XVID'), 20.0, (w, h))
+                    # Increased to 15.0 FPS as 8.0 was too slow (Slow Motion)
+                    video_writer = cv2.VideoWriter(filepath, cv2.VideoWriter_fourcc(*'XVID'), 15.0, (w, h))
                     print(f"[Recording] Started: {filepath}")
                 
                 video_writer.write(display)

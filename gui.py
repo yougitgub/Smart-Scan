@@ -179,13 +179,15 @@ class TimeConfigApp:
                     cmd, 
                     stdout=subprocess.PIPE, 
                     stderr=subprocess.STDOUT, 
-                    text=True, 
-                    bufsize=1,
+                    # Drop text=True to handle bytes manually to avoid encoding crashes
+                    text=False, 
                     creationflags=creation_flags
                 )
                 
-                for line in iter(process.stdout.readline, ''):
-                    if line:
+                for line_bytes in iter(process.stdout.readline, b''):
+                    if line_bytes:
+                        # manually decode with error replacement
+                        line = line_bytes.decode('utf-8', errors='replace')
                         # Schedule GUI update on main thread
                         self.master.after(0, self.log, line)
                 

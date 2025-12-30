@@ -233,6 +233,7 @@ def generate_known_embeddings(directory_path: str):
     main_logic(enroll=False, on_exist='skip', directory=directory_path)
 
 def main_logic(enroll=False, on_exist='skip', directory=ENROLLMENT_DIRECTORY):
+    on_exist = on_exist.lower().strip()
     print(f"━━━ Enrollment Mode: {on_exist.upper()} ━━━")
     interactive = enroll
     
@@ -271,6 +272,10 @@ def main_logic(enroll=False, on_exist='skip', directory=ENROLLMENT_DIRECTORY):
                  print(f"⏭  Skipped: {student} (already enrolled)")
                  print(f"[TECH] Student {sid} exists in DB, policy=skip", file=sys.stderr)
                  continue
+            elif sid in db and on_exist == 'replace':
+                 print(f"🔄 Re-enrolling: {student} (Policy: Replace)")
+            elif sid in db and on_exist == 'append':
+                 pass # Will append later
             
             print(f"[{current}/{total_students}] Processing {student}...", end='')
             print(f"\n[TECH] Processing file: {f_path}", file=sys.stderr)
@@ -319,7 +324,10 @@ def main_logic(enroll=False, on_exist='skip', directory=ENROLLMENT_DIRECTORY):
                 db[sid] = {'name': student, 'embeddings': [], 'year': None, 'class': None}
             
             # Update Embeddings Logic
-            if on_exist == 'replace': 
+            # Update Embeddings Logic
+            if on_exist == 'replace' or on_exist == 'skip': 
+                # If 'skip', we are here strictly because it's a NEW user (existing were skipped above).
+                # If 'replace', we overwrite.
                 db[sid]['embeddings'] = embeddings
             elif on_exist == 'append':
                 db[sid]['embeddings'].extend(embeddings)
