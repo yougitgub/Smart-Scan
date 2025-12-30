@@ -20,13 +20,13 @@ EMBEDDINGS_FILE = 'known_embeddings.pkl'
 STREAM_URL = 'rtsp://admin:1234qwer@@192.168.1.18:554/Streaming/Channels/102?tcp'
 
 # --- THRESHOLDS ---
-RECOGNITION_THRESHOLD = 0.95  # Relaxed
-STRICT_THRESHOLD = 1.0       # Relaxed
-YOLO_CONFIDENCE_THRESHOLD = 0.70
+RECOGNITION_THRESHOLD = 0.90  
+STRICT_THRESHOLD = 0.85       
+YOLO_CONFIDENCE_THRESHOLD = 0.65
 
 # --- Temporal Consistency Settings ---
-CONFIRM_FRAMES = 2
-REQUIRED_VOTES = 1 # Instant match
+CONFIRM_FRAMES = 1  # Increased from 2 for better stability
+REQUIRED_VOTES = 1    # Increased from 1 to filtering noise
 MAX_BOX_DISTANCE = 100
 
 # --- MySQL Config ---
@@ -96,6 +96,8 @@ class DatabaseWorker(threading.Thread):
                     cursor.execute("INSERT INTO attendance (student_id, date, status, created_at, updated_at) VALUES (%s, %s, %s, NOW(), NOW())", (iid, today, status))
                     conn.commit()
                     print(f"  [DB] Marked {status.upper()}: {s_id}")
+                else:
+                    print(f"  [DB] Skipped {s_id} (Already Marked)")
             conn.close()
         except Exception as e: print(f"  [DB Error] {e}")
 
@@ -196,7 +198,7 @@ class DetectionWorker(threading.Thread):
                         except queue.Full: pass
                 except: pass
             
-            time.sleep(0.001)
+            time.sleep(0.00001)
 
 # --- 4. Recognition Thread (Slow Path) ---
 class RecognitionWorker(threading.Thread):
@@ -206,7 +208,12 @@ class RecognitionWorker(threading.Thread):
 
     def run(self):
         print("[Thread] Recognition Worker Started")
-        global shared_identities, mtcnn, resnet, faiss_index, known_names, known_ids
+        global shared_identities, resnet, faiss_index, known_names, known_ids
+        
+        # Auto-detect device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"[Recog] Using Device: {device}")
+        if resnet: resnet.to(device)
         
         while self.running:
             try:
@@ -217,9 +224,11 @@ class RecognitionWorker(threading.Thread):
                 now = time.time()
                 self.history = {k:v for k,v in self.history.items() if isinstance(v, dict) and now - v.get('last_seen', 0) < 2.0}
 
+                batch_crops = []
+                batch_meta = [] # Stores (track_id, box, original_name_placeholder)
+
                 for box in boxes:
                     x1,y1,x2,y2 = box
-                    # Clamp
                     h, w = frame.shape[:2]
                     x1=max(0,x1); y1=max(0,y1); x2=min(w,x2); y2=min(h,y2)
                     
@@ -238,73 +247,99 @@ class RecognitionWorker(threading.Thread):
                     self.history[track_id]['last_seen'] = now
                     self.history[track_id]['last_center'] = (cx, cy)
 
-                    # 2. Recognition
-                    name="Unknown"; sid=None
+                    # Prepare for batch
                     crop = frame[y1:y2, x1:x2]
-                    
                     if crop.size > 0:
-                        emb = self._get_emb(crop)
-                        if emb is not None and faiss_index is not None:
+                        resized = cv2.resize(crop, (160, 160))
+                        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+                        batch_crops.append(rgb)
+                        batch_meta.append((track_id, box))
+                    else:
+                        # Empty crop, treat as unknown
+                        self._process_vote(track_id, "Unknown", None, box, confirmed)
+
+                # Batch Inference
+                embeddings = []
+                if batch_crops and resnet:
+                    try:
+                        # Normalize and convert to tensor
+                        data = np.stack(batch_crops) # (B, 160, 160, 3)
+                        t = torch.from_numpy(data).permute(0, 3, 1, 2).float() # (B, 3, 160, 160)
+                        t = (t - 127.5) / 128.0
+                        t = t.to(device)
+                        
+                        with torch.no_grad():
+                            embs_out = resnet(t).detach().cpu().numpy()
+                            embeddings = embs_out # (B, 512)
+                    except Exception as e:
+                        print(f"[Recog Batch Error] {e}")
+                
+                # Process Embeddings
+                emb_idx = 0
+                for idx, (track_id, box) in enumerate(batch_meta):
+                    name = "Unknown"; sid = None
+                    
+                    if emb_idx < len(embeddings):
+                        emb = embeddings[emb_idx]
+                        emb_idx += 1
+                        
+                        if faiss_index is not None:
+                            # Normalize vector if needed (FaceNet uses Euclidean, but some versions prefer normalized)
+                            # Here we stick to raw output matching previous logic
                             D, I = faiss_index.search(emb.reshape(1,-1), 1)
                             dist = D[0][0]
-                            idx = I[0][0]
+                            idx_db = I[0][0]
                             threshold = RECOGNITION_THRESHOLD**2
                             
-                            print(f"  > [Recog] Dist={dist:.4f} vs Thresh={threshold:.4f}")
-
-                            if idx != -1 and dist < threshold:
+                            if idx_db != -1 and dist < threshold:
                                 if dist < STRICT_THRESHOLD**2:
-                                    name = known_names[idx]
-                                    sid = known_ids[idx]
-                                    print(f"    ✅ RAW MATCH: {name}")
+                                    name = known_names[idx_db]
+                                    sid = known_ids[idx_db]
+                                    print(f"    ✅ MATCH: {name} ({dist:.4f})")
                                 else:
-                                    print(f"    ⚠️  AMBIGUOUS: {known_names[idx]}")
+                                    print(f"    ⚠️  AMBIGUOUS: {known_names[idx_db]} ({dist:.4f})")
 
-                    # 3. Voting / Temporal Consistency
-                    try:
-                        votes = self.history[track_id].get('votes', [])
-                        if not isinstance(votes, list): votes = []
-                        
-                        votes.append((name, sid))
-                        if len(votes) > CONFIRM_FRAMES: votes.pop(0)
-                        self.history[track_id]['votes'] = votes # Ensure saved back
-
-                        # Tally votes
-                        valid_votes = [v for v in votes if v[0] != "Unknown"]
-                        final_name = "Unknown"; final_id = None
-                        
-                        if len(valid_votes) >= REQUIRED_VOTES:
-                            from collections import Counter
-                            # valid_votes is list of tuples: [('Name', 'ID'), ...]
-                            counts = Counter(valid_votes)
-                            if counts:
-                                (best_name, best_id), count = counts.most_common(1)[0]
-                                if count >= REQUIRED_VOTES:
-                                    final_name, final_id = best_name, best_id
-                                    print(f"    🏆 CONFIRMED: {final_name}")
-                        
-                        confirmed.append({'box': box, 'name': final_name, 'id': final_id, 'ts': time.time()})
-                    except Exception as e:
-                        print(f"    [Voting Error] {e}")
-                        confirmed.append({'box': box, 'name': "Unknown", 'id': None, 'ts': time.time()})
+                    self._process_vote(track_id, name, sid, box, confirmed)
                 
                 with state_lock:
                     shared_identities.update({id(box): c for box, c in zip(boxes, confirmed)})
                     now = time.time()
-                    
-                    # Safe Pruning Logic (Avoids crashing on 'latest_list' which is a list, not dict)
                     clean_state = {}
                     for k, v in shared_identities.items():
-                        if k == 'latest_list': continue # Skip, we update it below
+                        if k == 'latest_list': continue
                         if isinstance(v, dict) and (now - v.get('ts', 0) < 1.0):
                             clean_state[k] = v
-                    
                     clean_state['latest_list'] = confirmed
                     shared_identities = clean_state 
 
                 recog_queue.task_done()
             except queue.Empty: continue
             except Exception as e: print(f"Recog Worker Loop Error: {e}")
+
+    def _process_vote(self, track_id, name, sid, box, confirmed_list):
+        try:
+            votes = self.history[track_id].get('votes', [])
+            if not isinstance(votes, list): votes = []
+            
+            votes.append((name, sid))
+            if len(votes) > CONFIRM_FRAMES: votes.pop(0)
+            self.history[track_id]['votes'] = votes
+            
+            valid_votes = [v for v in votes if v[0] != "Unknown"]
+            final_name = "Unknown"; final_id = None
+            
+            if len(valid_votes) >= REQUIRED_VOTES:
+                from collections import Counter
+                counts = Counter(valid_votes)
+                if counts:
+                    (best_name, best_id), count = counts.most_common(1)[0]
+                    if count >= REQUIRED_VOTES:
+                        final_name, final_id = best_name, best_id
+            
+            confirmed_list.append({'box': box, 'name': final_name, 'id': final_id, 'ts': time.time()})
+        except:
+             confirmed_list.append({'box': box, 'name': "Unknown", 'id': None, 'ts': time.time()})
+
 
     def _match_history(self, cx, cy):
         best_id = None; min_dist = MAX_BOX_DISTANCE
@@ -318,20 +353,7 @@ class RecognitionWorker(threading.Thread):
         
         return best_id
 
-    def _get_emb(self, img):
-        if not mtcnn or not resnet: return None
-        try:
-             face_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-             t = mtcnn(face_rgb)
-             if t is None:
-                 resized = cv2.resize(face_rgb, (160, 160))
-                 t = torch.from_numpy(resized).permute(2, 0, 1).float()
-                 t = (t - 127.5) / 128.0
-             if t is not None:
-                 e = resnet(t.unsqueeze(0).to('cpu')).detach().cpu().numpy().flatten()
-                 return e[:512] if e.shape[0]==1024 else e
-             return None
-        except: return None
+
 
 # --- Load Utilities ---
 def load_db():
@@ -372,7 +394,7 @@ def real_time_face_recognition():
 
     try:
         model_yolo = YOLO(YOLO_MODEL_PATH)
-        mtcnn = MTCNN(keep_all=False, device='cpu')
+        # mtcnn removed using direct resizing
         resnet = InceptionResnetV1(pretrained='vggface2').eval()
         load_db()
     except Exception as E: print(f"Init Error: {E}"); return
@@ -392,7 +414,7 @@ def real_time_face_recognition():
     try:
         while True:
             frame = cam.get_frame()
-            if frame is None: time.sleep(0.01); continue
+            if frame is None: time.sleep(0.0001); continue
             
             with state_lock:
                 shared_latest_frame = frame

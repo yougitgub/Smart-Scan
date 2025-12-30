@@ -207,7 +207,7 @@ def show_gui(name, n_id, image_path=None):
         y_var.pack()
         
         ttk.Label(root, text="Class:").pack()
-        c_var = ttk.Combobox(root, values=[f"{l}-{n}" for l in "ABCDEF" for n in range(1, 11)], state="readonly")
+        c_var = ttk.Combobox(root, values=[f"{l}-{n}" for l in "ABC" for n in range(1, 7)], state="readonly")
         c_var.pack()
         
         def save():
