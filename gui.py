@@ -1,224 +1,222 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
 import json
 import os
-import re # Import for checking the time format
+import subprocess
+import sys
+import threading
 
 # --- Configuration ---
 CONFIG_FILE = 'config.json'
 DEFAULT_TIMES = {
-    'lateness_time': "07:00",  # Time after start_time that is considered late
-    'absence_time': "10:00",   # Time after start_time that is considered an absence
-    'start_time': "06:00"      # Required clock-in time in HH:MM format
+    'lateness_time': "07:00",
+    'absence_time': "10:00",
+    'start_time': "06:00"
 }
-# 'presence_minutes' has been removed from the default settings.
-
-# Regex to validate HH:MM format
-TIME_REGEX = re.compile(r'^\d{2}:\d{2}$')
-
-# --- Core Functions ---
 
 def load_settings(file_path: str) -> dict:
-    """
-    Loads configuration settings from a JSON file. 
-    Returns default settings if the file is not found or is invalid.
-    """
     if os.path.exists(file_path):
         try:
             with open(file_path, 'r') as f:
                 settings = json.load(f)
-                # Ensure the loaded data has ALL expected keys. Use defaults for missing keys if necessary.
                 updated_settings = DEFAULT_TIMES.copy()
                 updated_settings.update(settings)
-                
-                # We check again if all keys are present after updating from file
-                if all(key in updated_settings for key in DEFAULT_TIMES):
-                    print(f"Loaded settings from {file_path}")
-                    return updated_settings
-        except (json.JSONDecodeError, IOError, TypeError) as e:
-            print(f"Error loading settings from {file_path}: {e}. Using default.")
-    
-    print(f"Using default settings: {DEFAULT_TIMES}")
+                return updated_settings
+        except:
+            pass
     return DEFAULT_TIMES
 
 def save_settings(file_path: str, settings: dict):
-    """
-    Saves the current configuration settings to a JSON file.
-    """
     try:
         with open(file_path, 'w') as f:
             json.dump(settings, f, indent=4)
-        print(f"Settings saved successfully to {file_path}")
-    except IOError as e:
-        messagebox.showerror("Save Error", f"Could not save settings file: {e}")
-
-def validate_time_format(time_str: str) -> bool:
-    """Checks if a string is a valid time in HH:MM format (00:00 to 23:59)."""
-    if TIME_REGEX.match(time_str):
-        try:
-            H, M = map(int, time_str.split(':'))
-            # Check hours (0-23) and minutes (0-59) for validity
-            if 0 <= H <= 23 and 0 <= M <= 59:
-                return True
-        except ValueError:
-            return False
-    return False
-
-# --- Tkinter Application Class ---
+        print(f"Settings saved.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Could not save settings: {e}")
 
 class TimeConfigApp:
     def __init__(self, master):
         self.master = master
-        self.master.title("Time Policy Configuration")
-        # Slightly smaller window and non-resizable for a compact layout
-        self.master.geometry("350x320")
-        self.master.resizable(False, False)
+        self.master.title("Attendance Manager")
+        self.master.geometry("600x750") # Taller for logs
+        self.master.resizable(True, True)
+        
+        # Style
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        
+        self.colors = {
+            'bg': '#f3f4f6', 
+            'white': '#ffffff',
+            'primary': '#3b82f6', 
+            'success': '#10b981', 
+            'text': '#1f2937',
+            'text_light': '#6b7280',
+            'black': '#000000'
+        }
+        
+        self.master.configure(bg=self.colors['bg'])
+        self.style.configure('TFrame', background=self.colors['bg'])
+        self.style.configure('TLabel', background=self.colors['bg'], foreground=self.colors['text'], font=('Segoe UI', 10))
+        self.style.configure('Header.TLabel', font=('Segoe UI', 12, 'bold'), foreground=self.colors['primary'])
+        self.style.configure('Card.TFrame', background=self.colors['white'], relief='flat')
+        self.style.configure('CardLabel.TLabel', background=self.colors['white'])
+        
+        self.style.configure('Primary.TButton', font=('Segoe UI', 10, 'bold'), borderwidth=0, focuscolor='none')
+        self.style.map('Primary.TButton', background=[('active', '#2563eb'), ('!disabled', self.colors['primary'])], foreground=[('!disabled', 'white')])
 
-        # 1. Load initial settings
+        self.style.configure('Success.TButton', font=('Segoe UI', 10, 'bold'), borderwidth=0, focuscolor='none')
+        self.style.map('Success.TButton', background=[('active', '#059669'), ('!disabled', self.colors['success'])], foreground=[('!disabled', 'white')])
+
         self.current_settings = load_settings(CONFIG_FILE)
-
-        # 2. Tkinter variables to hold user input
-        # Split existing HH:MM into hours and minutes vars for separate inputs
-        def split_time(t: str):
-            try:
-                h, m = t.split(":")
-                return h.zfill(2), m.zfill(2)
-            except Exception:
-                return "00", "00"
+        
+        # Vars
+        def split_time(t):
+            try: return t.split(":") 
+            except: return "00", "00"
 
         sh, sm = split_time(self.current_settings.get('start_time', '06:00'))
         lh, lm = split_time(self.current_settings.get('lateness_time', '07:00'))
         ah, am = split_time(self.current_settings.get('absence_time', '10:00'))
 
-        self.start_hour_var = tk.StringVar(value=sh)
-        self.start_min_var = tk.StringVar(value=sm)
+        self.start_h, self.start_m = tk.StringVar(value=sh), tk.StringVar(value=sm)
+        self.late_h, self.late_m = tk.StringVar(value=lh), tk.StringVar(value=lm)
+        self.abs_h, self.abs_m = tk.StringVar(value=ah), tk.StringVar(value=am)
 
-        self.lateness_hour_var = tk.StringVar(value=lh)
-        self.lateness_min_var = tk.StringVar(value=lm)
-
-        self.absence_hour_var = tk.StringVar(value=ah)
-        self.absence_min_var = tk.StringVar(value=am)
+        self.enroll_interactive = tk.BooleanVar(value=False)
+        self.on_exist_var = tk.StringVar(value="skip")
 
         self.create_widgets()
 
     def create_widgets(self):
-        """Sets up the UI elements using grid layout."""
+        main_container = ttk.Frame(self.master, padding=20)
+        main_container.pack(fill='both', expand=True)
 
-        # Configure grid weights for centering
-        self.master.grid_columnconfigure(0, weight=1)
-        self.master.grid_columnconfigure(1, weight=1)
+        # Header
+        header_frame = ttk.Frame(main_container)
+        header_frame.pack(fill='x', pady=(0, 20))
+        ttk.Label(header_frame, text="SmartScan Admin", font=('Segoe UI', 18, 'bold'), foreground='#111827').pack(side='left')
+        ttk.Label(header_frame, text="Production Mode", foreground=self.colors['text_light']).pack(side='right', pady=(10,0))
 
-        # Main content frame with tighter padding
-        frame = tk.Frame(self.master, padx=12, pady=12)
-        frame.grid(row=0, column=0, columnspan=2, padx=8, pady=8, sticky="nsew")
+        # Card 1: Time
+        self._create_card(main_container, "Attendance Schedule", self._build_time_ui)
 
-        # --- Row 0: Required Start Time ---
-        tk.Label(frame, text="Required Start Time:", font=('Helvetica', 10, 'bold')).grid(row=0, column=0, sticky='w', pady=8)
-        start_frame = tk.Frame(frame)
-        start_frame.grid(row=0, column=1, sticky='e', padx=10, pady=6)
-        self.start_hour_entry = tk.Entry(start_frame, textvariable=self.start_hour_var, width=3, relief=tk.GROOVE)
-        colon_label = tk.Label(start_frame, text=":")
-        self.start_min_entry = tk.Entry(start_frame, textvariable=self.start_min_var, width=3, relief=tk.GROOVE)
-        # Pack in order: hour, small label, colon, minute, small label
-        self.start_hour_entry.pack(side='left')
-        tk.Label(start_frame, text='hrs', font=('Helvetica', 9)).pack(side='left', padx=(4,6))
-        colon_label.pack(side='left', padx=4)
-        self.start_min_entry.pack(side='left')
-        tk.Label(start_frame, text='min', font=('Helvetica', 9)).pack(side='left', padx=(4,0))
+        # Card 2: Enrollment
+        self._create_card(main_container, "Student Enrollment", self._build_enroll_ui)
 
-        # --- Row 1: Lateness Cutoff Time ---
-        tk.Label(frame, text="Lateness Cutoff Time:", font=('Helvetica', 10, 'bold')).grid(row=1, column=0, sticky='w', pady=8)
-        lateness_frame = tk.Frame(frame)
-        lateness_frame.grid(row=1, column=1, sticky='e', padx=10, pady=6)
-        self.lateness_hour_entry = tk.Entry(lateness_frame, textvariable=self.lateness_hour_var, width=3, relief=tk.GROOVE)
-        colon_label2 = tk.Label(lateness_frame, text=":")
-        self.lateness_min_entry = tk.Entry(lateness_frame, textvariable=self.lateness_min_var, width=3, relief=tk.GROOVE)
-        self.lateness_hour_entry.pack(side='left')
-        tk.Label(lateness_frame, text='hrs', font=('Helvetica', 9)).pack(side='left', padx=(4,6))
-        colon_label2.pack(side='left', padx=4)
-        self.lateness_min_entry.pack(side='left')
-        tk.Label(lateness_frame, text='min', font=('Helvetica', 9)).pack(side='left', padx=(4,0))
+        # Card 3: Logs
+        self._create_card(main_container, "System Logs", self._build_log_ui)
 
-        # --- Row 2: Absence Cutoff Time ---
-        tk.Label(frame, text="Absence Cutoff Time:", font=('Helvetica', 10, 'bold')).grid(row=2, column=0, sticky='w', pady=8)
-        absence_frame = tk.Frame(frame)
-        absence_frame.grid(row=2, column=1, sticky='e', padx=10, pady=6)
-        self.absence_hour_entry = tk.Entry(absence_frame, textvariable=self.absence_hour_var, width=3, relief=tk.GROOVE)
-        colon_label3 = tk.Label(absence_frame, text=":")
-        self.absence_min_entry = tk.Entry(absence_frame, textvariable=self.absence_min_var, width=3, relief=tk.GROOVE)
-        self.absence_hour_entry.pack(side='left')
-        tk.Label(absence_frame, text='hrs', font=('Helvetica', 9)).pack(side='left', padx=(4,6))
-        colon_label3.pack(side='left', padx=4)
-        self.absence_min_entry.pack(side='left')
-        tk.Label(absence_frame, text='min', font=('Helvetica', 9)).pack(side='left', padx=(4,0))
+        # Footer
+        footer_frame = ttk.Frame(main_container, padding=(0, 10))
+        footer_frame.pack(fill='x', side='bottom')
+        
+        save_btn = ttk.Button(footer_frame, text="START SYSTEM", style='Success.TButton', command=self.on_start)
+        save_btn.pack(fill='x', ipady=8)
 
-        # --- Action Buttons (placed inside the frame for compactness) ---
-        buttons_frame = tk.Frame(frame)
-        buttons_frame.grid(row=3, column=0, columnspan=2, pady=(14, 4))
+    def _create_card(self, parent, title, build_fn):
+        card = ttk.Frame(parent, style='Card.TFrame', padding=15)
+        card.pack(fill='x', pady=(0, 15))
+        title_lbl = ttk.Label(card, text=title.upper(), font=('Segoe UI', 9, 'bold'), foreground=self.colors['text_light'], style='CardLabel.TLabel')
+        title_lbl.pack(anchor='w', pady=(0, 15))
+        build_fn(card)
 
-        self.save_button = tk.Button(buttons_frame, text="Start the System", command=self.on_save,
-                                     bg='#4CAF50', fg='white', font=('Helvetica', 14, 'bold'),
-                                     activebackground='#45a049', activeforeground='white',
-                                     relief=tk.RAISED, padx=12, pady=8)
-        self.save_button.pack(fill='x', padx=10, pady=(0, 8))
+    def _build_time_ui(self, parent):
+        grid = ttk.Frame(parent, style='Card.TFrame')
+        grid.pack(fill='x')
+        self._time_row(grid, "Start Time", self.start_h, self.start_m, 0)
+        self._time_row(grid, "Late After", self.late_h, self.late_m, 1)
+        self._time_row(grid, "Absent After", self.abs_h, self.abs_m, 2)
 
-        self.rescan_button = tk.Button(buttons_frame, text="Re-Scan Student Images", command=self.rescan,
-                                       bg='#2196F3', fg='white', font=('Helvetica', 10, 'bold'),
-                                       activebackground='#0b7dda', activeforeground='white',
-                                       relief=tk.RAISED, padx=10, pady=6)
-        self.rescan_button.pack(padx=60, pady=(0, 4))
+    def _time_row(self, parent, label, h, m, row):
+        parent.columnconfigure(1, weight=1)
+        lbl = ttk.Label(parent, text=label, style='CardLabel.TLabel')
+        lbl.grid(row=row, column=0, sticky='w', pady=8)
+        input_frame = ttk.Frame(parent, style='Card.TFrame')
+        input_frame.grid(row=row, column=1, sticky='e')
+        ttk.Entry(input_frame, textvariable=h, width=3, justify='center', font=('Segoe UI', 11)).pack(side='left')
+        ttk.Label(input_frame, text=" : ", style='CardLabel.TLabel', font=('Segoe UI', 11, 'bold')).pack(side='left')
+        ttk.Entry(input_frame, textvariable=m, width=3, justify='center', font=('Segoe UI', 11)).pack(side='left')
 
-    def on_save(self):
-        """Validates input, updates settings, and saves to file."""
+    def _build_enroll_ui(self, parent):
+        chk = ttk.Checkbutton(parent, text="Adding to Cloud (Main Database)", variable=self.enroll_interactive, style='Switch.TCheckbutton')
+        chk.pack(anchor='w', pady=(0, 10))
+        f = ttk.Frame(parent, style='Card.TFrame')
+        f.pack(fill='x', pady=5)
+        ttk.Label(f, text="Duplicate ID Policy:", style='CardLabel.TLabel').pack(side='left')
+        ttk.Combobox(f, textvariable=self.on_exist_var, values=["Skip", "Replace"], state="readonly", width=12).pack(side='right')
+        
+        self.run_btn = ttk.Button(parent, text="Run Enrollment Process", style='Primary.TButton', command=self.run_enrollment)
+        self.run_btn.pack(fill='x', pady=(15, 0), ipady=5)
 
-        try:
-            # 1. Get hours and minutes from inputs and validate ranges
-            sh = self.start_hour_var.get()
-            sm = self.start_min_var.get()
-            lh = self.lateness_hour_var.get()
-            lm = self.lateness_min_var.get()
-            ah = self.absence_hour_var.get()
-            am = self.absence_min_var.get()
+    def _build_log_ui(self, parent):
+        # Console Log Area
+        self.log_text = ScrolledText(parent, height=8, font=("Consolas", 9), state='disabled', bg="#1e1e1e", fg="#00ff00")
+        self.log_text.pack(fill='both', expand=True)
 
-            def validate_hm(h_str, m_str, field_name):
-                if not (h_str.isdigit() and m_str.isdigit()):
-                    raise ValueError(f"{field_name}: Hours and minutes must be numeric.")
-                h = int(h_str)
-                m = int(m_str)
-                if not (0 <= h <= 23):
-                    raise ValueError(f"{field_name}: Hours must be between 0 and 23.")
-                if not (0 <= m <= 59):
-                    raise ValueError(f"{field_name}: Minutes must be between 0 and 59.")
-                return f"{h:02d}:{m:02d}"
+    def log(self, message):
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, message)
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
 
-            start_time = validate_hm(sh, sm, 'Start Time')
-            lateness_time = validate_hm(lh, lm, 'Lateness Cutoff Time')
-            absence_time = validate_hm(ah, am, 'Absence Cutoff Time')
-
-            # 3. Update the settings dictionary
-            new_settings = {
-                'start_time': start_time,
-                'lateness_time': lateness_time,
-                'absence_time': absence_time,
-            }
-
-            # 4. Save to JSON file
-            save_settings(CONFIG_FILE, new_settings)
-
-            messagebox.showinfo("Success", "All time settings have been saved successfully. System will start now.")
+    def run_enrollment(self):
+        enroll_arg = "true" if self.enroll_interactive.get() else "false"
+        policy_arg = self.on_exist_var.get()
+        
+        self.run_btn.config(state='disabled')
+        self.log("--- Starting Enrollment Subprocess ---\n")
+        
+        def run_thread():
+            cmd = [sys.executable, "generate_face_embeddings.py", "--enroll", enroll_arg, "--on-exist", policy_arg]
             
-            self.master.destroy()  # Close the application after saving
-        except ValueError as e:
-            messagebox.showerror("Invalid Input", f"Please enter valid data for all fields.\nError: {e}")
-
-    def rescan(self):
-        """Trigger re-scan of student images to update embeddings."""
-        from generate_face_embeddings import generate_known_embeddings, ENROLLMENT_DIRECTORY, KNOWN_EMBEDDINGS_FILE
-        if messagebox.askyesno("Re-Scan Confirmation", "This will re-scan the student images and update embeddings. Continue?"):
+            # CREATE_NO_WINDOW = 0x08000000 (Windows only) to hide CMD
+            creation_flags = 0x08000000 if sys.platform == 'win32' else 0
+            
             try:
-                generate_known_embeddings(ENROLLMENT_DIRECTORY)
-                messagebox.showinfo("Re-Scan Complete", "Student images have been re-scanned and embeddings updated.")
+                process = subprocess.Popen(
+                    cmd, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.STDOUT, 
+                    text=True, 
+                    bufsize=1,
+                    creationflags=creation_flags
+                )
+                
+                for line in iter(process.stdout.readline, ''):
+                    if line:
+                        # Schedule GUI update on main thread
+                        self.master.after(0, self.log, line)
+                
+                process.stdout.close()
+                return_code = process.wait()
+                
+                self.master.after(0, self.log, f"\n--- Process Finished with Code {return_code} ---\n")
             except Exception as e:
-                messagebox.showerror("Re-Scan Error", f"An error occurred during re-scan: {e}")
-root = tk.Tk()
-app = TimeConfigApp(root)
+                self.master.after(0, self.log, f"Error: {e}\n")
+            finally:
+                 self.master.after(0, lambda: self.run_btn.config(state='normal'))
+
+        threading.Thread(target=run_thread, daemon=True).start()
+
+    def on_start(self):
+        try:
+            def get_time(h, m):
+                if not (h.get().isdigit() and m.get().isdigit()): raise ValueError 
+                return f"{int(h.get()):02d}:{int(m.get()):02d}"
+
+            new_settings = {
+                'start_time': get_time(self.start_h, self.start_m),
+                'lateness_time': get_time(self.late_h, self.late_m),
+                'absence_time': get_time(self.abs_h, self.abs_m)
+            }
+            save_settings(CONFIG_FILE, new_settings)
+            self.master.destroy()
+        except:
+             messagebox.showerror("Invalid Input", "Time fields must be numeric (HH:MM).")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = TimeConfigApp(root)
+    root.mainloop()
