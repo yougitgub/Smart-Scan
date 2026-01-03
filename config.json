@@ -1,5 +1,7 @@
 {
     "start_time": "07:07",
     "lateness_time": "14:40",
-    "absence_time": "15:45"
+    "absence_time": "15:45",
+    "enable_recording": true,
+    "camera_url": "rtsp://admin:1234qwer@@192.168.1.18:554/Streaming/Channels/102?tcp"
 }

@@ -13,23 +13,21 @@ from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime, time as dtime, timedelta
 import json
 import mysql.connector
+import tkinter as tk
+from tkinter import messagebox
 
-# --- Configuration ---
 YOLO_MODEL_PATH = 'detection/weights/yolov12n-face.pt'
 EMBEDDINGS_FILE = 'known_embeddings.pkl'
 STREAM_URL = 'rtsp://admin:1234qwer@@192.168.1.18:554/Streaming/Channels/102?tcp'
 
-# --- THRESHOLDS ---
 RECOGNITION_THRESHOLD = 0.90  
 STRICT_THRESHOLD = 0.85       
 YOLO_CONFIDENCE_THRESHOLD = 0.65
 
-# --- Temporal Consistency Settings ---
-CONFIRM_FRAMES = 1  # Increased from 2 for better stability
-REQUIRED_VOTES = 1    # Increased from 1 to filtering noise
+CONFIRM_FRAMES = 1
+REQUIRED_VOTES = 1
 MAX_BOX_DISTANCE = 100
 
-# --- MySQL Config ---
 DB_CONFIG = {
     'host': '127.0.0.1',
     'port': 3306,
@@ -38,15 +36,12 @@ DB_CONFIG = {
     'database': 'system'
 }
 
-# --- Shared Resources ---
 db_queue = queue.Queue()
-recog_queue = queue.Queue(maxsize=2) # Increased buffer slightly 
+recog_queue = queue.Queue(maxsize=2)
 state_lock = threading.Lock()
-# fast_state: Updated by Detection Thread (High FPS) -> [(x1,y1,x2,y2), ...]
 shared_detected_boxes = []
 shared_detected_ts = 0
 
-# slow_state: Updated by Recognition Thread (Low FPS) -> { track_id: {'name': str, 'id': str} }
 shared_identities = {}
 
 shared_latest_frame = None
@@ -58,7 +53,6 @@ faiss_index = None
 known_names = []
 known_ids = []
 
-# --- 1. Database Thread ---
 class DatabaseWorker(threading.Thread):
     def __init__(self):
         super().__init__()
@@ -71,13 +65,11 @@ class DatabaseWorker(threading.Thread):
             try:
                 task = db_queue.get(timeout=1)
                 task_type = task[0]
-                
                 if task_type == "mark_attendance":
                     _, s_id, status = task
                     self._mark_attendance(s_id, status)
                 elif task_type == "bulk_absent":
                     self._bulk_absent()
-                
                 db_queue.task_done()
             except queue.Empty: continue
             except Exception as e: print(f"[DB Error] {e}")
@@ -114,10 +106,9 @@ class DatabaseWorker(threading.Thread):
             count = cursor.rowcount
             conn.commit()
             conn.close()
-            if count > 0: print(f"\n[SYSTEM] 🕒 Time's up! Marked {count} absent records.\n")
+            if count > 0: print(f"\n[SYSTEM]  Time's up! Marked {count} absent records.\n")
         except: pass
 
-# --- 2. Camera Thread ---
 class CameraHandler(threading.Thread):
     def __init__(self, stream_url: str):
         super().__init__()
@@ -128,6 +119,7 @@ class CameraHandler(threading.Thread):
         self.latest_frame = None
         self.lock = threading.Lock()
         self.cap = None
+        self.error_shown = False
 
     def run(self):
         print("[Thread] Camera Handler Started")
@@ -135,23 +127,43 @@ class CameraHandler(threading.Thread):
             if not self.connected or self.cap is None or not self.cap.isOpened():
                 try:
                     if self.cap: self.cap.release()
-                    print(f"[Camera] Connecting...")
+                    print(f"[Camera] Connecting to {self.stream_url}...")
                     self.cap = cv2.VideoCapture(self.stream_url)
                     self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    if self.cap.isOpened():
+                    if self.cap.isOpened() and self.cap.grab():
                         self.connected = True
+                        self.error_shown = False
                         print("[Camera] Connected.")
                     else:
+                        if not self.error_shown:
+                            self._show_error(f"Failed to connect to camera:\n{self.stream_url}\n\nPlease check the URL and network connection.")
+                            self.error_shown = True
                         time.sleep(2); continue
-                except: time.sleep(2); continue
+                except Exception as e:
+                    if not self.error_shown:
+                        self._show_error(f"Camera Connection Error:\n{e}")
+                        self.error_shown = True
+                    time.sleep(2); continue
 
             try:
                 success, frame = self.cap.read()
                 if success:
                     with self.lock: self.latest_frame = frame
-                else: self.connected = False
+                else: 
+                    self.connected = False
+                    if not self.error_shown:
+                        self._show_error("Camera connection lost.")
+                        self.error_shown = True
             except: self.connected = False
-                
+
+    def _show_error(self, msg):
+        def pop():
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            messagebox.showerror("SmartScan - Camera Error", msg)
+            root.destroy()
+        threading.Thread(target=pop, daemon=True).start()
     def get_frame(self):
         with self.lock: return self.latest_frame if self.connected else None
 
@@ -160,7 +172,6 @@ class CameraHandler(threading.Thread):
         self.join()
         if self.cap: self.cap.release()
 
-# --- 3. Detection Thread (Fast Path) ---
 class DetectionWorker(threading.Thread):
     def __init__(self):
         super().__init__()
@@ -173,7 +184,6 @@ class DetectionWorker(threading.Thread):
             img = None
             with state_lock:
                 if shared_latest_frame is not None: img = shared_latest_frame.copy()
-            
             if img is None: time.sleep(0.01); continue
 
             if model_yolo:
@@ -183,24 +193,18 @@ class DetectionWorker(threading.Thread):
                     for box in results[0].boxes:
                         x1,y1,x2,y2 = map(int, box.xyxy[0])
                         boxes.append((x1,y1,x2,y2))
-                    
                     if boxes:
-                        print(f"[YOLO] Found {len(boxes)} faces") # LOGGING
+                        print(f"[YOLO] Found {len(boxes)} faces")
 
-                    # FAST PATH UPDATE
                     with state_lock:
                         shared_detected_boxes = boxes
                         shared_detected_ts = time.time()
-                    
                     if boxes:
-                        # SLOW PATH HANDOFF
                         try: recog_queue.put_nowait((img, boxes, time.time()))
                         except queue.Full: pass
                 except: pass
-            
             time.sleep(0.00001)
 
-# --- 4. Recognition Thread (Slow Path) ---
 class RecognitionWorker(threading.Thread):
     def __init__(self):
         super().__init__()
@@ -209,45 +213,35 @@ class RecognitionWorker(threading.Thread):
     def run(self):
         print("[Thread] Recognition Worker Started")
         global shared_identities, resnet, faiss_index, known_names, known_ids
-        
-        # Auto-detect device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"[Recog] Using Device: {device}")
         if resnet: resnet.to(device)
-        
         while self.running:
             try:
                 frame, boxes, ts = recog_queue.get(timeout=1)
                 confirmed = []
-                
-                # Prune old history
                 now = time.time()
                 self.history = {k:v for k,v in self.history.items() if isinstance(v, dict) and now - v.get('last_seen', 0) < 2.0}
 
                 batch_crops = []
-                batch_meta = [] # Stores (track_id, box, original_name_placeholder)
+                batch_meta = []
 
                 for box in boxes:
                     x1,y1,x2,y2 = box
                     h, w = frame.shape[:2]
                     x1=max(0,x1); y1=max(0,y1); x2=min(w,x2); y2=min(h,y2)
-                    
-                    # 1. Coordinate Matching for History
                     cx, cy = (x1+x2)//2, (y1+y2)//2
                     track_id = self._match_history(cx, cy)
-                    
                     if track_id is None:
                         track_id = now + (cx/10000.0)
                         self.history[track_id] = {'votes': [], 'last_seen': now, 'last_center': (cx, cy)}
 
-                    # Safety Check
                     if not isinstance(self.history[track_id], dict):
                          self.history[track_id] = {'votes': [], 'last_seen': now, 'last_center': (cx, cy)}
 
                     self.history[track_id]['last_seen'] = now
                     self.history[track_id]['last_center'] = (cx, cy)
 
-                    # Prepare for batch
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
                         resized = cv2.resize(crop, (160, 160))
@@ -255,42 +249,31 @@ class RecognitionWorker(threading.Thread):
                         batch_crops.append(rgb)
                         batch_meta.append((track_id, box))
                     else:
-                        # Empty crop, treat as unknown
                         self._process_vote(track_id, "Unknown", None, box, confirmed)
 
-                # Batch Inference
                 embeddings = []
                 if batch_crops and resnet:
                     try:
-                        # Normalize and convert to tensor
-                        data = np.stack(batch_crops) # (B, 160, 160, 3)
-                        t = torch.from_numpy(data).permute(0, 3, 1, 2).float() # (B, 3, 160, 160)
+                        data = np.stack(batch_crops)
+                        t = torch.from_numpy(data).permute(0, 3, 1, 2).float()
                         t = (t - 127.5) / 128.0
                         t = t.to(device)
-                        
                         with torch.no_grad():
                             embs_out = resnet(t).detach().cpu().numpy()
-                            embeddings = embs_out # (B, 512)
+                            embeddings = embs_out
                     except Exception as e:
                         print(f"[Recog Batch Error] {e}")
-                
-                # Process Embeddings
                 emb_idx = 0
                 for idx, (track_id, box) in enumerate(batch_meta):
                     name = "Unknown"; sid = None
-                    
                     if emb_idx < len(embeddings):
                         emb = embeddings[emb_idx]
                         emb_idx += 1
-                        
                         if faiss_index is not None:
-                            # Normalize vector if needed (FaceNet uses Euclidean, but some versions prefer normalized)
-                            # Here we stick to raw output matching previous logic
                             D, I = faiss_index.search(emb.reshape(1,-1), 1)
                             dist = D[0][0]
                             idx_db = I[0][0]
                             threshold = RECOGNITION_THRESHOLD**2
-                            
                             if idx_db != -1 and dist < threshold:
                                 if dist < STRICT_THRESHOLD**2:
                                     name = known_names[idx_db]
@@ -300,7 +283,6 @@ class RecognitionWorker(threading.Thread):
                                     print(f"    ⚠️  AMBIGUOUS: {known_names[idx_db]} ({dist:.4f})")
 
                     self._process_vote(track_id, name, sid, box, confirmed)
-                
                 with state_lock:
                     shared_identities.update({id(box): c for box, c in zip(boxes, confirmed)})
                     now = time.time()
@@ -320,14 +302,11 @@ class RecognitionWorker(threading.Thread):
         try:
             votes = self.history[track_id].get('votes', [])
             if not isinstance(votes, list): votes = []
-            
             votes.append((name, sid))
             if len(votes) > CONFIRM_FRAMES: votes.pop(0)
             self.history[track_id]['votes'] = votes
-            
             valid_votes = [v for v in votes if v[0] != "Unknown"]
             final_name = "Unknown"; final_id = None
-            
             if len(valid_votes) >= REQUIRED_VOTES:
                 from collections import Counter
                 counts = Counter(valid_votes)
@@ -335,7 +314,6 @@ class RecognitionWorker(threading.Thread):
                     (best_name, best_id), count = counts.most_common(1)[0]
                     if count >= REQUIRED_VOTES:
                         final_name, final_id = best_name, best_id
-            
             confirmed_list.append({'box': box, 'name': final_name, 'id': final_id, 'ts': time.time()})
         except:
              confirmed_list.append({'box': box, 'name': "Unknown", 'id': None, 'ts': time.time()})
@@ -350,12 +328,10 @@ class RecognitionWorker(threading.Thread):
                 if dist < min_dist:
                     min_dist = dist
                     best_id = tid
-        
         return best_id
 
 
 
-# --- Load Utilities ---
 def load_db():
     global faiss_index, known_names, known_ids
     if not os.path.exists(EMBEDDINGS_FILE): return False
@@ -382,11 +358,17 @@ def parse_time(s):
 
 def in_range(s, e, n): return s<=n<e if s<=e else n>=s or n<e
 
-# --- MAIN ORCHESTRATOR ---
-def real_time_face_recognition():
+def real_time_face_recognition(stop_event=None, output_callback=None):
     global model_yolo, mtcnn, resnet, shared_latest_frame
-    
-    cfg={'start_time':'06:00','lateness_time':'07:00','absence_time':'10:00'}
+
+    def log(msg):
+        if output_callback: output_callback(f"{msg}\n")
+        else: print(msg)
+    cfg={
+        'start_time':'06:00','lateness_time':'07:00','absence_time':'10:00', 
+        'enable_recording': True,
+        'camera_url': STREAM_URL
+    }
     if os.path.exists('config.json'):
          try: cfg.update(json.load(open('config.json')))
          except: pass
@@ -394,52 +376,43 @@ def real_time_face_recognition():
 
     try:
         model_yolo = YOLO(YOLO_MODEL_PATH)
-        # mtcnn removed using direct resizing
         resnet = InceptionResnetV1(pretrained='vggface2').eval()
         load_db()
-    except Exception as E: print(f"Init Error: {E}"); return
+    except Exception as E: log(f"Init Error: {E}"); return
 
-    cam = CameraHandler(STREAM_URL); cam.start()
+    cam = CameraHandler(cfg.get('camera_url', STREAM_URL))
+    if stop_event and stop_event.is_set(): return
+    cam.start()
     DatabaseWorker().start(); DetectionWorker().start(); RecognitionWorker().start()
-    print("--- 🚀 ULTRA-FAST RENDERING ACTIVE 🚀 ---")
-    
+    log("---  ULTRA-FAST RENDERING ACTIVE  ---")
     local_cache=set(); abs_checked=False
 
-    # --- Recording Setup ---
     rec_dir = "recordings"
     os.makedirs(rec_dir, exist_ok=True)
     video_writer = None
-    is_recording = True 
+    is_recording = cfg.get('enable_recording', True) 
 
     try:
         while True:
+            if stop_event and stop_event.is_set(): break
             frame = cam.get_frame()
             if frame is None: time.sleep(0.0001); continue
-            
             with state_lock:
                 shared_latest_frame = frame
-                # GET FAST BOXES
                 cur_boxes = shared_detected_boxes[:]
                 cur_ts = shared_detected_ts
-                # GET SLOW NAMES (Use Memory Dict, not just latest snapshot)
                 cur_identities = [v for k,v in shared_identities.items() if k != 'latest_list']
 
 
             display = frame.copy()
             now = datetime.now().time()
-            
-            # Draw Logic: Match Fast Box to Closest Slow Identity
-            # If Fast Detection is stale (>0.5s), clear it (Fixes Ghosting if detection thread dies)
             if time.time() - cur_ts > 0.5:
                 cur_boxes = []
 
             for (x1,y1,x2,y2) in cur_boxes:
                 cx, cy = (x1+x2)//2, (y1+y2)//2
-                
-                # Find Identity
                 name = "Unknown"; sid = None
                 min_dist = MAX_BOX_DISTANCE
-                
                 if cur_identities:
                     for ident in cur_identities:
                         ibox = ident['box']
@@ -458,7 +431,6 @@ def real_time_face_recognition():
                         if now >= t_abs: status="absent"; color=(0,0,255)
                         else: status="early"
                     txt = f"{name} [{status.upper()}]"
-                    
                     if sid and (sid not in local_cache) and (status != 'early'):
                         db_queue.put(("mark_attendance", sid, status))
                         local_cache.add(sid)
@@ -466,36 +438,31 @@ def real_time_face_recognition():
                 cv2.rectangle(display, (x1,y1), (x2,y2), color, 2)
                 cv2.putText(display, txt, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # --- Video Recording ---
             if is_recording:
                 if video_writer is None:
                     h, w = display.shape[:2]
                     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                     filepath = os.path.join(rec_dir, f"session_{timestamp}.avi")
-                    # Increased to 15.0 FPS as 8.0 was too slow (Slow Motion)
                     video_writer = cv2.VideoWriter(filepath, cv2.VideoWriter_fourcc(*'XVID'), 15.0, (w, h))
-                    print(f"[Recording] Started: {filepath}")
-                
+                    log(f"[Recording] Started: {filepath}")
                 video_writer.write(display)
 
             if now >= t_abs:
                 if not abs_checked:
                     db_queue.put(("bulk_absent", None, None))
                     abs_checked = True
-                    
-                    # Stop recording at absence time
                     if is_recording:
                         print("[Recording] Absence Time Reached. Stopping Video.")
                         is_recording = False
                         if video_writer: video_writer.release()
                         video_writer = None
-                    
                     print("[SYSTEM] Closing system in 3 seconds...")
                     time.sleep(3)
-                    break # Exit Main Loop
+                    break
 
             cv2.imshow("SmartScan Ultra", display)
-            if cv2.waitKey(1) == ord('q'): break
+            if cv2.waitKey(1) == ord('q') or (stop_event and stop_event.is_set()): break
     finally:
         if video_writer: video_writer.release()
         cam.stop(); cv2.destroyAllWindows()
+        log("--- System Stopped ---")

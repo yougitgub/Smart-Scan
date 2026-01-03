@@ -1,12 +1,3 @@
-# face_recognition_super_v2_debug.py
-# Advanced threaded face recognition with attendance logic (improved debug version)
-# - Uses RTSP camera (fixed)
-# - FAISS with NumPy fallback
-# - GPU auto-detect
-# - Video saved in recordings/ at 30 FPS (uses actual frame size)
-# - Shows FPS overlay and prints debug info for threads and queues
-# - Stops at absence time: writes absences, saves, and exits cleanly
-# NOTE: Configure paths: YOLO_MODEL_PATH, EMBEDDINGS_FILE, STREAM_URL, EXCEL_FILE, config.json
 
 import os, sys, time, threading, queue, json, pickle
 from datetime import datetime, timedelta, time as dtime
@@ -21,14 +12,12 @@ import openpyxl
 from ultralytics import YOLO
 from facenet_pytorch import MTCNN, InceptionResnetV1
 
-# FAISS optional
 try:
     import faiss
     FAISS_AVAILABLE = True
 except Exception:
     FAISS_AVAILABLE = False
 
-# -------- CONFIG --------
 YOLO_MODEL_PATH = 'detection/weights/yolov11n-face.pt'
 EMBEDDINGS_FILE = 'known_embeddings.pkl'
 EXCEL_FILE = 'DashBoard.xlsx'
@@ -48,15 +37,11 @@ FRAME_Q_MAX = 1
 VIDEO_Q_MAX = 512
 EXCEL_Q_MAX = 1024
 
-# ensure recordings dir
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# device
-# DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 DEVICE = "cpu"
 print(f"[System] Using device: {DEVICE} (cuda available: {torch.cuda.is_available()})")
 
-# ---------- helper time functions ----------
 def now_str():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -93,13 +78,12 @@ def is_time_in_range(start: dtime, end: dtime, now_t: dtime) -> bool:
     else:
         return now_t >= start or now_t < end
 
-# ---------- load models ----------
 print("[System] Loading models...")
 try:
     model_yolo = YOLO(YOLO_MODEL_PATH)
     if DEVICE == 'cuda':
         try:
-            model_yolo.to('cuda')   # move YOLO model to GPU
+            model_yolo.to('cuda')
         except Exception:
             pass
 
@@ -116,14 +100,12 @@ except Exception as e:
     print(f"[ERROR] Face models load failed: {e}")
     mtcnn = None; resnet = None
 
-# ---------- embeddings & FAISS ----------
 FAISS_INDEX = None
 KNOWN_NAMES: List[str] = []
 KNOWN_EMBEDDINGS = None
 
 def load_known_embeddings(path=EMBEDDINGS_FILE):
     global FAISS_INDEX, KNOWN_NAMES, KNOWN_EMBEDDINGS
-    # After loading KNOWN_EMBEDDINGS and KNOWN_NAMES
     if not os.path.exists(path):
         print(f"[WARN] Embeddings file not found: {path}")
         return False
@@ -151,21 +133,6 @@ def load_known_embeddings(path=EMBEDDINGS_FILE):
         print(f"[ERROR] load_known_embeddings: {e}")
         return False
 
-# ❌ REMOVE THIS FUNCTION — NO LONGER NEEDED
-# def search_embeddings_batch(query_embs: np.ndarray):
-#     if query_embs is None or len(query_embs)==0:
-#         return np.array([]), np.array([])
-#     if FAISS_AVAILABLE and FAISS_INDEX is not None:
-#         D, I = FAISS_INDEX.search(query_embs, 1)
-#         return D, I
-#     else:
-#         A = KNOWN_EMBEDDINGS
-#         D_list = []; I_list = []
-#         for q in query_embs:
-#             dists = np.linalg.norm(A - q, axis=1)
-#             idxs = np.argsort(dists)[:1]
-#             D_list.append(dists[idxs]); I_list.append(idxs)
-#         return np.vstack(D_list), np.vstack(I_list)
 
 def compute_embeddings_batch(crops: List[np.ndarray]) -> List[Optional[np.ndarray]]:
     if not crops: return []
@@ -210,14 +177,12 @@ def compute_embeddings_batch(crops: List[np.ndarray]) -> List[Optional[np.ndarra
         result[out_idx] = e
     return result
 
-# ---------- Queues ----------
 frame_q = queue.Queue(maxsize=FRAME_Q_MAX)
 video_q = queue.Queue(maxsize=VIDEO_Q_MAX)
 excel_q = queue.Queue(maxsize=EXCEL_Q_MAX)
 
 recognized_names = set()
 
-# ---------- Thread classes ----------
 class CameraThread(threading.Thread):
     def __init__(self, src: str, frame_q: queue.Queue):
         super().__init__(daemon=True)
@@ -247,7 +212,6 @@ class CameraThread(threading.Thread):
                 try:
                     _ = self.frame_q.get_nowait()
                     self.frame_q.put_nowait((frame.copy(), ts))
-                    # print("[Camera] Frame queue full - dropped oldest frame to insert new one")
                 except Exception:
                     pass
     def stop(self):
@@ -272,7 +236,7 @@ class VideoWriterThread(threading.Thread):
 
         self._frame_count = 0
         self._start_time = time.time()
-        self._last_frame_time = None  # track actual timestamps
+        self._last_frame_time = None
 
         print(f"[Video] Recording in real time: {self.filename} ({self.frame_size[0]}x{self.frame_size[1]}, {self.fps} fps)")
 
@@ -287,11 +251,9 @@ class VideoWriterThread(threading.Thread):
             if frame is None:
                 continue
 
-            # Adjust to actual frame size
             if (frame.shape[1], frame.shape[0]) != self.frame_size:
                 frame = cv2.resize(frame, self.frame_size)
 
-            # Real-time sync based on capture timestamp
             frame_time = meta.get('time', datetime.now())
             if self._last_frame_time is not None:
                 diff = (frame_time - self._last_frame_time).total_seconds()
@@ -306,14 +268,12 @@ class VideoWriterThread(threading.Thread):
             except Exception as e:
                 print(f"[ERROR] Writing frame: {e}")
 
-            # Log every 5 sec
             if time.time() - last_log > 5.0:
                 elapsed = time.time() - self._start_time
                 avg_fps = self._frame_count / elapsed if elapsed > 0 else 0
                 print(f"[Video] Frames written: {self._frame_count}, Avg FPS: {avg_fps:.2f}")
                 last_log = time.time()
 
-        # finalize
         try:
             self._writer.release()
             print(f"[Video] Recording saved: {self.filename}")
@@ -393,7 +353,6 @@ class ExcelLoggerThread(threading.Thread):
             try:
                 task = self.excel_q.get(timeout=0.5)
             except queue.Empty:
-                # periodic save
                 if time.time() - self._last_save >= self._save_interval and self._wb:
                     try: self._wb.save(self.path); self._last_save = time.time(); print("[Excel] Auto-saved") 
                     except Exception as e: print(f"[ERROR] autosave: {e}")
@@ -416,7 +375,6 @@ class ExcelLoggerThread(threading.Thread):
             print(f"[ERROR] Excel stop save: {e}")
 
 
-# ✅ EDITED RecognitionThread — Uses FAISS for BOTH tracking and recognition
 class RecognitionThread(threading.Thread):
     def __init__(self, frame_q: queue.Queue, video_q: queue.Queue, excel_q: queue.Queue):
         super().__init__(daemon=True)
@@ -433,13 +391,11 @@ class RecognitionThread(threading.Thread):
         self._fps_count = 0
         self.realtime_fps = 0.0
 
-        # FAISS structures for embedding-based tracking
         self.faiss_index = None
-        self.track_ids_for_index = []   # parallel list: index i → track_id
+        self.track_ids_for_index = []
         self.embedding_dim = None
 
     def update_faiss_index(self):
-        """Rebuild FAISS index from current track embeddings."""
         emb_list = []
         self.track_ids_for_index = []
         for tid, t in self.tracks.items():
@@ -458,7 +414,6 @@ class RecognitionThread(threading.Thread):
         self.faiss_index = index
 
     def find_track_by_embedding(self, emb, threshold=0.6):
-        """Match embedding to existing tracks via FAISS. Return track_id or None."""
         if self.faiss_index is None or emb.shape[0] != self.embedding_dim:
             return None
         query = emb.reshape(1, -1).astype('float32')
@@ -490,7 +445,7 @@ class RecognitionThread(threading.Thread):
             self._fps_prev = now
 
     def run(self):
-        global KNOWN_NAMES, FAISS_INDEX, recognized_names  # ✅ Use FAISS_INDEX, not RECOGNITION_INDEX
+        global KNOWN_NAMES, FAISS_INDEX, recognized_names
         print('[Recognition] Started')
 
         while self.running:
@@ -514,7 +469,6 @@ class RecognitionThread(threading.Thread):
                     pass
                 continue
 
-            # YOLO detection
             try:
                 yres = model_yolo(frame, verbose=False, conf=YOLO_CONF)
             except Exception as e:
@@ -535,7 +489,6 @@ class RecognitionThread(threading.Thread):
             analyze_tids = []
             new_tracks = {}
 
-            # Rebuild FAISS index from current tracks BEFORE processing detections
             self.update_faiss_index()
 
             for box in detections:
@@ -543,7 +496,6 @@ class RecognitionThread(threading.Thread):
                 x1, y1, x2, y2 = max(0, x1), max(0, y1), min(W - 1, x2), min(H - 1, y2)
                 crop = frame[y1:y2, x1:x2]
 
-                # Compute temporary embedding JUST for matching (not for recognition yet)
                 temp_emb = None
                 if crop is not None and crop.size > 0:
                     try:
@@ -557,7 +509,6 @@ class RecognitionThread(threading.Thread):
                 if temp_emb is not None:
                     tid = self.find_track_by_embedding(temp_emb)
 
-                # If no match, create new track
                 if tid is None:
                     tid = self.next_id
                     self.next_id += 1
@@ -566,7 +517,7 @@ class RecognitionThread(threading.Thread):
                         'history': [],
                         'seen_count': 0,
                         'analysis_runs': 0,
-                        'last_recognition': 'Unknown',  # Initialize to string
+                        'last_recognition': 'Unknown',
                         'cached_embedding': None,
                         'cached_time': None,
                         'logged': False,
@@ -609,7 +560,6 @@ class RecognitionThread(threading.Thread):
                 t['last_time_seen'] = datetime.now()
                 new_tracks[tid] = t
 
-            # compute embeddings for analyze_crops asynchronously
             if analyze_crops:
                 future = self.pool.submit(compute_embeddings_batch, analyze_crops)
                 try:
@@ -635,11 +585,9 @@ class RecognitionThread(threading.Thread):
 
                 if valid_embs:
                     qmat = np.vstack(valid_embs).astype('float32')
-                    # ✅ USE GLOBAL FAISS_INDEX FOR RECOGNITION (replaces search_embeddings_batch)
                     if FAISS_INDEX is not None:
-                        D, I = FAISS_INDEX.search(qmat, 1)  # k=1
+                        D, I = FAISS_INDEX.search(qmat, 1)
                     else:
-                        # Fallback to NumPy if FAISS not available (shouldn't happen if loaded)
                         A = KNOWN_EMBEDDINGS
                         D_list = []; I_list = []
                         for q in qmat:
@@ -658,7 +606,6 @@ class RecognitionThread(threading.Thread):
                         new_tracks[tid]['last_recognition'] = name
                         new_tracks[tid]['history'] = (new_tracks[tid]['history'] + [name])[-CONFIRM_FRAMES:]
 
-            # draw and logging
             for tid, t in new_tracks.items():
                 x1, y1, x2, y2 = t['box']
                 hist = t.get('history', [])
@@ -723,12 +670,10 @@ class RecognitionThread(threading.Thread):
                 cv2.putText(frame, label_line2, (x1, y_text + 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, second_color, 2)
 
-            # fps overlay
             fps_text = f"FPS: {self.realtime_fps:.2f}"
             cv2.putText(frame, fps_text, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
-            # merge new_tracks into self.tracks
             for tid, new_t in new_tracks.items():
                 if tid in self.tracks:
                     old_t = self.tracks[tid]
@@ -741,7 +686,6 @@ class RecognitionThread(threading.Thread):
                 else:
                     self.tracks[tid] = new_t
 
-            # send frame
             try:
                 self.video_q.put_nowait((frame.copy(), {'time': datetime.now()}))
             except queue.Full:
@@ -751,7 +695,6 @@ class RecognitionThread(threading.Thread):
             except:
                 pass
 
-            # absence time check
             cur_time = datetime.now().time()
             if cur_time >= self.absence_time_obj:
                 print('[Recognition] Absence time reached, sending ABSENCE task to Excel thread')
@@ -770,7 +713,6 @@ class RecognitionThread(threading.Thread):
             pass
 
 
-# ---------- Main and shutdown ----------
 threads = {}
 cam = None; vw = None; xl = None; rec = None
 
@@ -789,7 +731,6 @@ def shutdown_system():
     try:
         if cam and getattr(cam,'running',False): cam.stop()
     except: pass
-    # clear queues
     time.sleep(1)
     try:
         cv2.destroyAllWindows(); cv2.waitKey(1)
@@ -821,10 +762,8 @@ def main():
         print('[WARN] No embeddings loaded; recognition will be Unknown')
     else:
         print(f'[System] Loaded {len(KNOWN_NAMES)} known identities')
-    # start camera
     frame_q_local = frame_q
     cam = CameraThread(STREAM_URL, frame_q_local); cam.start()
-    # wait for first valid frame to know size
     first_frame = None; t0=time.time()
     while True:
         try:
@@ -834,16 +773,12 @@ def main():
                 print('[ERROR] No frames from camera within 15s. Exiting.'); cam.stop(); return
             print('[System] Waiting for first frame...'); time.sleep(1)
     H,W = first_frame.shape[:2]
-    # start video writer with real size
     filename = os.path.join(OUTPUT_DIR, f"record_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
     vw = VideoWriterThread(video_q, filename, OUTPUT_FPS, (W,H));vw.start()
-    # excel thread
     xl = ExcelLoggerThread(excel_q, EXCEL_FILE); xl.set_shutdown_callback(shutdown_system); xl.start()
-    # recognition thread
     rec = RecognitionThread(frame_q_local, video_q, excel_q); rec.start()
     threads.update({'cam':cam,'vw':vw,'xl':xl,'rec':rec})
     print('[System] All threads started. Viewer loop running. Press q to quit.')
-    # main viewer loop
     absence_triggered = False
     _,_,absence_time_obj = load_times()
     try:
@@ -856,7 +791,6 @@ def main():
                 except: pass
             except queue.Empty:
                 pass
-            # monitor absence_time and trigger Excel ABSENCE task
             cur_t = datetime.now().time()
             if cur_t >= absence_time_obj and not absence_triggered:
                 print(f'[Main] Absence time reached: {absence_time_obj} - sending ABSENCE task')
@@ -864,12 +798,10 @@ def main():
                 except queue.Full: print('[ERROR] Could not send ABSENCE task - excel queue full'); shutdown_system(); break
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 print('[Main] Manual quit requested'); shutdown_system(); break
-            # check xl.absence_done to exit
             if xl and getattr(xl, 'absence_done', False):
                 print('[Main] Excel reported absence done; exiting main loop'); break
     except KeyboardInterrupt:
         print('[Main] KeyboardInterrupt received'); shutdown_system()
-    # cleanup final
     print('[Main] Final cleanup...')
     try:
         if rec and getattr(rec,'running',False): rec.stop()

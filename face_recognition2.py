@@ -1,14 +1,3 @@
-# face_recognition_super.py
-# ------------------------------------------------------------
-# Super-threaded version of Smart Scan Face Recognition System
-# Features:
-# - 5 main threads (Camera, Detection, RecognitionManager, WorkerPool, ExcelWriter)
-# - GPU auto-detection
-# - YOLO + MTCNN + ResNet + FAISS
-# - Time-based attendance logic
-# - RTSP camera only
-# - Real-time drawing and console logs
-# ------------------------------------------------------------
 
 import os, cv2, time, threading, queue, json, pickle, faiss, torch, openpyxl
 import numpy as np
@@ -16,9 +5,6 @@ from datetime import datetime, timedelta, time as dtime
 from ultralytics import YOLO
 from facenet_pytorch import MTCNN, InceptionResnetV1
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
 YOLO_MODEL_PATH = 'detection/weights/yolov12n-best.pt'
 EMBEDDINGS_FILE = 'known_embeddings.pkl'
 EXCEL_FILE = 'DashBoard.xlsx'
@@ -29,22 +15,13 @@ CONFIRM_FRAMES = 1
 REQUIRED_VOTES = 1
 MAX_BOX_DISTANCE = 50
 
-# ------------------------------------------------------------
-# Device Auto Detection
-# ------------------------------------------------------------
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"[System] Using device: {device}")
 
-# ------------------------------------------------------------
-# Model Loading
-# ------------------------------------------------------------
 model_yolo = YOLO(YOLO_MODEL_PATH)
 mtcnn = MTCNN(keep_all=True, device=device)
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-# ------------------------------------------------------------
-# Load Known Embeddings
-# ------------------------------------------------------------
 def load_embeddings():
     with open(EMBEDDINGS_FILE, 'rb') as f:
         data = pickle.load(f)
@@ -61,9 +38,6 @@ def load_embeddings():
 
 faiss_index, known_names = load_embeddings()
 
-# ------------------------------------------------------------
-# Excel Setup
-# ------------------------------------------------------------
 try:
     workbook = openpyxl.load_workbook(EXCEL_FILE)
     sheet = workbook.active
@@ -73,9 +47,6 @@ except Exception as e:
     workbook = None
     sheet = None
 
-# ------------------------------------------------------------
-# Time Parsing
-# ------------------------------------------------------------
 def parse_time(s: str) -> dtime:
     try:
         parts = s.split(':')
@@ -88,18 +59,12 @@ def is_time_in_range(start, end, now):
         return start <= now < end
     return now >= start or now < end
 
-# ------------------------------------------------------------
-# Queues
-# ------------------------------------------------------------
 frame_queue = queue.Queue(maxsize=2)
 face_queue = queue.Queue(maxsize=20)
 result_queue = queue.Queue(maxsize=50)
 excel_queue = queue.Queue(maxsize=100)
 recognized_names = set()
 
-# ------------------------------------------------------------
-# Threads
-# ------------------------------------------------------------
 class CameraThread(threading.Thread):
     def __init__(self):
         super().__init__()
@@ -227,9 +192,6 @@ class ExcelThread(threading.Thread):
         self.running = False
         self.flush()
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
 def main():
     cam = CameraThread()
     det = DetectionThread()
